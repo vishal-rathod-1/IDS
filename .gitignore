@@ -1,0 +1,30 @@
+
+# Log files
+*.log
+*.pcap
+
+# Configuration files with sensitive data (e.g., passwords, API keys)
+suricata/suricata.yaml
+zeek/local.zeek
+filebeat/filebeat.yml
+filebeat/modules.d/
+elasticsearch/elasticsearch.yml
+kibana/kibana.yml
+
+# Suricata and Zeek output directories
+suricata/eve.json
+zeek/logs/
+
+# Temporary files
+*.swp
+*.bak
+*.tmp
+
+
+# Elasticsearch and Kibana data folders (if any)
+data/
+logs/
+
+# Other environment files
+.env
+auth.json
