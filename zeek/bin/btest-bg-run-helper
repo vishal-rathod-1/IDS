@@ -1,0 +1,38 @@
+#! /usr/bin/env bash
+#
+# Internal helper for btest-bg-run.
+
+cleanup() {
+    # Ignore SIGTERM during cleanup to prevent terminating
+    # this process when sending signals to the process group.
+    trap true SIGTERM
+
+    if [ ! -e .exitcode ]; then
+        echo 15 >.exitcode
+
+        # Send SIGTERM to all processes in the process group
+        # of the calling process.
+        #
+        # This should terminate any well-behaved background
+        # commands that were spawned by the program under test
+        # unless they started their own process group.
+        kill 0 &>/dev/null
+
+        if [ -n "$pid" ]; then
+            kill -0 "$pid" &>/dev/null && kill "$pid"
+            sleep 1
+            kill -0 "$pid" &>/dev/null && kill -9 "$pid" && echo 9 >.exitcode
+        fi
+    fi
+}
+
+trap "cleanup" EXIT
+
+eval "$* &"
+
+pid=$!
+echo $$ >.pid
+
+wait $pid
+echo $? >.exitcode
+pid=""

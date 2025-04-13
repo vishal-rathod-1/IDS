@@ -1,0 +1,3360 @@
+#! /usr/bin/env python3
+#
+# Main test driver.
+#
+# pylint: disable=line-too-long,too-many-lines,invalid-name,missing-function-docstring,
+# pylint: disable=missing-class-docstring
+
+import atexit
+import binascii
+import configparser
+import copy
+import fnmatch
+import glob
+import json
+import optparse
+import os
+import os.path
+import pathlib
+import platform as pform
+import re
+import shlex
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import uuid
+import xml.dom.minidom
+from datetime import datetime
+
+# We require the external multiprocess library on Windows due to pickling issues
+# with the standard one.
+if sys.platform == "win32":
+    try:
+        import multiprocess as mp
+        import multiprocess.managers as mp_managers
+        import multiprocess.sharedctypes as mp_sharedctypes
+    except ImportError as error:
+        print(
+            "error: btest failed to import the 'multiprocess' library\n"
+            "\n"
+            "This library is required for btest to function on Windows. "
+            "It can be installed from pip like:\n"
+            "\n"
+            "    pip install multiprocess\n"
+            "\n"
+            "Also check the following exception output for possible alternate explanations:\n\n"
+            f"{type(error).__name__}: {error}",
+            file=sys.stderr,
+        )
+else:
+    import multiprocessing as mp
+    import multiprocessing.managers as mp_managers
+    import multiprocessing.sharedctypes as mp_sharedctypes
+
+VERSION = "1.1-28"  # Automatically filled in.
+
+Name = "btest"
+Config = None
+
+try:
+    ConfigDefault = os.environ["BTEST_CFG"]
+except KeyError:
+    ConfigDefault = "btest.cfg"
+
+
+def normalize_path(path):
+    """Ensures that paths on Windows convert backslashes to forward slashes, to
+    make path handling easier in lots of other places. On non-Windows platforms
+    this is a no-op beyond converting things to absolute paths."""
+    os_path = os.path.abspath(path)
+    windows_path = pathlib.PureWindowsPath(os_path)
+    return windows_path.as_posix()
+
+
+def normalize_path_join(*args):
+    return normalize_path(os.path.join(*args))
+
+
+def reopen_std_file(stdfile):
+    """Reopens one of the stderr or stdout files, but resets the newline
+    used in the output to "\n" in order to force that line ending on Windows.
+    Without this, Windows will use "\r\n" which breaks a lot of tests."""
+    return open(
+        stdfile.fileno(),
+        mode=stdfile.mode,
+        buffering=1,
+        encoding=stdfile.encoding,
+        errors=stdfile.errors,
+        newline="\n",
+        closefd=False,
+    )
+
+
+def output(msg, nl=True, file=None):
+    if not file:
+        file = reopen_std_file(sys.__stderr__)
+
+    if nl:
+        print(msg, file=file)
+    else:
+        print(msg, end=" ", file=file)
+
+
+def warning(msg):
+    print(f"warning: {msg}", file=sys.stderr)
+
+
+def error(msg):
+    print(msg, file=sys.stderr)
+    sys.exit(1)
+
+
+def mkdir(folder):
+    if not os.path.exists(folder):
+        try:
+            os.makedirs(folder)
+        except OSError as exc:
+            error(f"cannot create directory {folder}: {exc}")
+
+    else:
+        if not os.path.isdir(folder):
+            error(f"path {folder} exists but is not a directory")
+
+
+def which(cmd):
+    # Adapted from http://stackoverflow.com/a/377028
+    def is_exe(fpath):
+        return os.path.isfile(fpath) and os.access(fpath, os.X_OK)
+
+    (fpath, _) = os.path.split(cmd)
+
+    if fpath:
+        if is_exe(cmd):
+            return cmd
+
+    else:
+        for path in os.environ["PATH"].split(os.pathsep):
+            path = path.strip('"')
+            exe_file = os.path.join(path, cmd)
+            if is_exe(exe_file):
+                return exe_file
+
+    return None
+
+
+def platform():
+    return pform.system()
+
+
+def validate_version_requirement(required: str, present: str):
+    """Validates that `present` version semantically satisfies `required` version."""
+
+    def extract_version(v: str):
+        """Helper function to extract version components from a string."""
+        try:
+            xyz = [int(x) for x in re.split(r"[.-]", v)]
+        except ValueError:
+            error(
+                f"invalid version {v}: versions must contain only numeric identifiers"
+            )
+
+        return xyz
+
+    v_present = extract_version(present)
+    v_required = extract_version(required)
+
+    if v_present < v_required:
+        error(
+            f"{Options.config} requires at least BTest {min_version}, this is {VERSION}. Please upgrade."
+        )
+
+
+# Get the value of the specified option in the specified section (or
+# section "btest" if not specified), or return the specified default value
+# if the option or section is not found.  The returned value has macros and
+# backticks from the config file expanded, but if the default value is returned
+# it will not be modified in any way.
+def getOption(key, default, section="btest"):
+    try:
+        value = Config.get(section, key)
+    except (configparser.NoSectionError, configparser.NoOptionError):
+        return default
+
+    return ExpandBackticks(value)
+
+
+reBackticks = re.compile(r"`(([^`]|`)*)`")
+
+
+def readTestsFile(file):
+    try:
+        # Read state file.
+        tests = []
+
+        for line in open(file, encoding="utf-8"):
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+
+            tests += [line]
+
+        tests = findTests(tests)
+
+    except OSError:
+        return (False, [])
+
+    return (True, tests)
+
+
+def _build_win_subprocess_cmd_script(cmd, tmpdir=None):
+    """
+    Builds a bash file for running subprocess commands under Windows.
+
+    :param cmd The command line to be run under bash.
+    :param tmpdir An optional directory path where the script file will be written.
+     If None, it will be written to the system's temp directory.
+    :return A tuple containing a file object pointing at the script file and a bash
+     command for running the script.
+    """
+    tf = tempfile.NamedTemporaryFile(
+        mode="w", encoding="utf-8", suffix=".sh", dir=tmpdir, delete=True
+    )
+    fcontents = f"#!/usr/bin/env bash\n{cmd}\n"
+    tf.write(fcontents)
+    tf.flush()
+
+    bash_cmd = ["bash.exe", "-c", normalize_path(tf.name)]
+    return tf, bash_cmd
+
+
+# Expand backticks in a config option value and return the result.
+def ExpandBackticks(origvalue):
+    def _exec(m):
+        cmd = m.group(1)
+        if not cmd:
+            return ""
+
+        tf = None
+        if sys.platform == "win32":
+            try:
+                tf, bash_cmd = _build_win_subprocess_cmd_script(cmd, None)
+                pp = subprocess.Popen(bash_cmd, stdout=subprocess.PIPE)
+            except OSError as e:
+                error(f"cannot execute '{cmd}': {e}")
+        else:
+            try:
+                pp = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE)
+            except OSError as e:
+                error(f"cannot execute '{cmd}': {e}")
+
+        out = pp.communicate()[0]
+        out = out.decode()
+
+        if tf:
+            tf.close()
+
+        return out.strip()
+
+    value = reBackticks.sub(_exec, origvalue)
+
+    return value
+
+
+# We monkey-patch the config parser to provide an alternative method that
+# expands backticks in option values and does not include defaults in
+# returned section items.
+def cpItemsNoDefaults(self, section):
+    # Get the keys from the specified section without anything from the
+    # default section (the values are raw, so we need to fetch the actual
+    # value below).
+    try:
+        items = self._sections[section].items()
+    except KeyError:
+        raise configparser.NoSectionError(section)
+
+    # Override any of the defaults with ones that we read from the command-line
+    # options before expanding macros below.
+    cfg_defaults = self.defaults()
+    if Options.defaults:
+        for d in Options.defaults:
+            k, v = d.split("=", 1)
+            cfg_defaults[k] = v.strip("'\"")
+
+    result = {}
+
+    for key, rawvalue in items:
+        # Python 2 includes a key of "__name__" that we don't want (Python 3
+        # doesn't include this)
+        if not key.startswith("__"):
+            # Expand macros such as %(testbase)s.
+            value = self.get(section, key)
+            # Expand backticks (if any) in the value.
+            result[key] = ExpandBackticks(value)
+
+    return result.items()
+
+
+def getcfgparser(defaults):
+    configparser.ConfigParser.itemsNoDefaults = cpItemsNoDefaults
+
+    cfg = configparser.ConfigParser()
+
+    # We make all key lookups case-sensitive to avoid aliasing of
+    # case-sensitive environment variables.
+    cfg.optionxform = lambda optionstr: optionstr
+
+    default_section = cfg.defaults()
+    for key, value in defaults.items():
+        default_section[key] = value
+
+    return cfg
+
+
+# Replace environment variables in string.
+def replaceEnvs(s):
+    def replace_with_env(m):
+        try:
+            return os.environ[m.group(1)]
+        except KeyError:
+            return ""
+
+    return RE_ENV.sub(replace_with_env, s)
+
+
+# Execute one of test's command line *cmdline*. *measure_time* indicates if
+# timing measurement is desired. *kw_args* are further keyword arguments
+# interpreted the same way as with subprocess.check_call().
+# Returns a 3-tuple (success, rc, time) where the former two likewise
+# have the same meaning as with runSubprocess(), and 'time' is an integer
+# value corresponding to the commands execution time measured in some
+# appropiate integer measure. If 'time' is negative, that's an indicator
+# that time measurement wasn't possible and the value is to be ignored.
+def runTestCommandLine(cmdline, measure_time, **kwargs):
+    if measure_time and Timer:
+        return Timer.timeSubprocess(cmdline, **kwargs)
+    (success, rc) = runSubprocess(cmdline, **kwargs)
+    return (success, rc, -1)
+
+
+# Runs a subprocess. Takes same arguments as subprocess.check_call()
+# and returns a 2-tuple (success, rc) where *success* is a boolean
+# indicating if the command executed, and *rc* is its exit code if it did.
+def runSubprocess(*args, **kwargs):
+    def child(q):
+        try:
+            if sys.platform == "win32":
+                tmpdir = normalize_path(kwargs.get("cwd", ""))
+                if len(args) > 1:
+                    cmd = shlex.join(args)
+                else:
+                    cmd = args[0]
+
+                tf, bash_cmd = _build_win_subprocess_cmd_script(cmd, tmpdir)
+                with tf:
+                    subprocess.check_call(bash_cmd, **kwargs)
+            else:
+                subprocess.check_call(*args, **kwargs)
+            success = True
+            rc = 0
+
+        except subprocess.CalledProcessError as e:
+            success = False
+            rc = e.returncode
+
+        except KeyboardInterrupt:
+            success = False
+            rc = 0
+
+        q.put([success, rc])
+
+    try:
+        q = mp.Queue()
+        p = mp.Process(target=child, args=(q,))
+        p.start()
+        result = q.get()
+        p.join()
+
+    except KeyboardInterrupt:
+        # Bail out here directly as otherwise we'd get a bunch of errors.
+        # from all the childs.
+        sys.exit(1)
+
+    return result
+
+
+# Description of an alternative configuration.
+class Alternative:
+    DEFAULT = "default"
+
+    def __init__(self, name):
+        self.name = name
+        self.filters = {}
+        self.substitutions = {}
+        self.envs = {}
+
+    def is_default(self):
+        return self.name == Alternative.DEFAULT
+
+    def is_empty(self):
+        return not (self.filters or self.substitutions or self.envs)
+
+
+# Exception class thrown to signal manager to abort processing.
+# The message passed to the constructor will be printed to the console.
+class Abort(Exception):
+    pass
+
+
+# Main class distributing the work across threads.
+class TestManager(mp_managers.SyncManager):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+        self._output_handler = None
+        self._lock = None
+        self._succeeded = None
+        self._failed = None
+        self._failed_expected = None
+        self._unstable = None
+        self._skipped = None
+        self._tests = None
+        self._failed_tests = None
+        self._num_tests = None
+        self._timing = None
+        self._ports = None
+
+    def run(self, tests, output_handler):
+        self.start()
+
+        mgr_data = self.dict()
+        mgr_data["Alternatives"] = Alternatives
+        mgr_data["BaselineDirs"] = BaselineDirs
+        mgr_data["Initializer"] = Initializer
+        mgr_data["Finalizer"] = Finalizer
+        mgr_data["Teardown"] = Teardown
+        mgr_data["Options"] = Options
+        mgr_data["TestBase"] = TestBase
+        mgr_data["TmpDir"] = TmpDir
+        mgr_data["RE_INPUT"] = RE_INPUT
+        mgr_data["RE_DIR"] = RE_DIR
+        mgr_data["RE_ENV"] = RE_ENV
+
+        output_handler.prepare(self)
+        self._output_handler = output_handler
+        self._lock = self.RLock()
+        self._succeeded = mp_sharedctypes.RawValue("i", 0)
+        self._failed = mp_sharedctypes.RawValue("i", 0)
+        self._failed_expected = mp_sharedctypes.RawValue("i", 0)
+        self._unstable = mp_sharedctypes.RawValue("i", 0)
+        self._skipped = mp_sharedctypes.RawValue("i", 0)
+        self._tests = self.list(tests)
+        self._failed_tests = self.list([])
+        self._num_tests = len(self._tests)
+        self._timing = self.loadTiming()
+
+        port_range = getOption("PortRange", "1024-65535")
+        port_range_lo = int(port_range.split("-")[0])
+        port_range_hi = int(port_range.split("-")[1])
+
+        if port_range_lo > port_range_hi:
+            error(f"invalid PortRange value: {port_range}")
+
+        max_test_ports = 0
+        test_with_most_ports = None
+
+        for t in self._tests:
+            if len(t.ports) > max_test_ports:
+                max_test_ports = len(t.ports)
+                test_with_most_ports = t
+
+        if max_test_ports > port_range_hi - port_range_lo + 1:
+            error(
+                f"PortRange {port_range} cannot satisfy requirement of {max_test_ports} ports in test {test_with_most_ports.name}"
+            )
+
+        self._ports = self.list(list(range(port_range_lo, port_range_hi + 1)))
+
+        threads = []
+
+        # With interactive input possibly required, we run tests
+        # directly. This avoids noisy output appearing from detached
+        # processes post-btest-exit when using CTRL-C during the input
+        # stage.
+        if Options.mode == "UPDATE_INTERACTIVE":
+            self.threadRun(0, mgr_data)
+        else:
+            try:
+                # Create a set of processes for running each of the tests. This isn't the actual
+                # zeek processes, but runner processes executing individual test commands.
+                for i in range(Options.threads):
+                    t = mp.Process(
+                        name=f"#{i+1}", target=lambda: self.threadRun(i, mgr_data)
+                    )
+                    t.start()
+                    threads += [t]
+
+                for t in threads:
+                    t.join()
+
+            except KeyboardInterrupt:
+                for t in threads:
+                    t.terminate()
+                    t.join()
+
+        if (
+            Options.abort_on_failure
+            and self._failed.value > 0
+            and self._failed.value > self._failed_expected.value
+        ):
+            # Signal abort. The child processes will already have
+            # finished because the join() above still ran.
+            raise Abort("Aborted after first failure.")
+
+        # Record failed tests if not updating.
+        if Options.mode != "UPDATE" and Options.mode != "UPDATE_INTERACTIVE":
+            try:
+                state = open(StateFile, "w", encoding="utf-8")
+            except OSError:
+                error(f"cannot open state file {StateFile}")
+
+            for t in sorted(self._failed_tests):
+                print(t, file=state)
+
+            state.close()
+
+        return (
+            self._succeeded.value,
+            self._failed.value,
+            self._skipped.value,
+            self._unstable.value,
+            self._failed_expected.value,
+        )
+
+    def percentage(self):
+        if not self._num_tests:
+            return 0
+
+        count = self._succeeded.value + self._failed.value + self._skipped.value
+        return 100.0 * count / self._num_tests
+
+    # Worker method for each of the "threads" specified by the "-j" argument passed
+    # at run time. This basically segments the list of tests into chunks and runs
+    # until we're out of chunks.
+    def threadRun(self, thread_num, mgr_data):
+        # This should prevent the child processes from receiving SIGINT signals and
+        # let the KeyboardInterrupt handler in the manager's run() method handle
+        # those.
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
+
+        all_tests = []
+
+        # Globals get lost moving from the parent to the child on Windows, so we need to use
+        # the data proxied from the manager to rebuild the dict of globals before continuing.
+        if sys.platform == "win32":
+            for global_key, global_value in mgr_data.items():
+                globals()[global_key] = global_value
+
+        while True:
+            # Pull the next test from the list that was built at startup. This may
+            # be more than one test if there were alternatives requested in the
+            # arguments passed to btest.
+            thread_tests = self.nextTests(thread_num)
+            if thread_tests is None:
+                # No more work for us.
+                return
+
+            all_tests += thread_tests
+
+            for t in thread_tests:
+                t.run(self)
+                self.testReplayOutput(t)
+
+            if Options.update_times:
+                self.saveTiming(all_tests)
+
+    def rerun(self, test):
+        test.reruns += 1
+        self._tests += [test.clone(increment=False)]
+
+    def nextTests(self, thread_num):
+        with self._lock:
+            if (
+                Options.abort_on_failure
+                and self._failed.value > 0
+                and self._failed.value > self._failed_expected.value
+            ):
+                # Don't hand out any more tests if we are to abort after
+                # first failure. Doing so will let all the processes terminate.
+                return None
+
+            for i in range(len(self._tests)):
+                t = self._tests[i]
+
+                if not t:
+                    continue
+
+                if t.serialize and t.serialize_hash() % Options.threads != thread_num:
+                    # Not ours.
+                    continue
+
+                # We'll execute it, delete from queue.
+                del self._tests[i]
+
+                if Options.alternatives:
+                    tests = []
+
+                    for alternative in Options.alternatives:
+                        if alternative in t.ignore_alternatives:
+                            continue
+
+                        if (
+                            t.include_alternatives
+                            and alternative not in t.include_alternatives
+                        ):
+                            continue
+
+                        alternative_test = copy.deepcopy(t)
+
+                        if alternative == Alternative.DEFAULT:
+                            alternative = ""
+
+                        alternative_test.setAlternative(alternative)
+                        tests += [alternative_test]
+
+                else:
+                    if (
+                        t.include_alternatives
+                        and Alternative.DEFAULT not in t.include_alternatives
+                    ):
+                        tests = []
+
+                    elif Alternative.DEFAULT in t.ignore_alternatives:
+                        tests = []
+
+                    else:
+                        tests = [t]
+
+                return tests
+
+        # No more tests for us.
+        return None
+
+    def returnPorts(self, ports):
+        with self._lock:
+            for p in ports:
+                self._ports.append(p)
+
+    def getAvailablePorts(self, count):
+        with self._lock:
+            if count > len(self._ports):
+                return []
+
+            first_port = -1
+            rval = []
+
+            for _ in range(count):
+                while True:
+                    if len(self._ports) == 0:
+                        for s in rval:
+                            s.close()
+                            self._ports.append(s.getsockname()[1])
+                        return []
+
+                    next_port = self._ports[0]
+
+                    if next_port == first_port:
+                        # Looped over port pool once, bail out.
+                        for s in rval:
+                            s.close()
+                            self._ports.append(s.getsockname()[1])
+
+                        return []
+
+                    if first_port == -1:
+                        first_port = next_port
+
+                    del self._ports[0]
+
+                    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+
+                    # Setting REUSEADDR would allow ports to be recycled
+                    # more quickly, but on macOS, seems to also have the
+                    # effect of allowing multiple sockets to bind to the
+                    # same port, even if REUSEPORT is off, so just try to
+                    # ensure both are off.
+                    if hasattr(socket, "SO_REUSEADDR"):
+                        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 0)
+                    if hasattr(socket, "SO_REUSEPORT"):
+                        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 0)
+
+                    try:
+                        sock.bind(("", next_port))
+                    except Exception:
+                        self._ports.append(next_port)
+                        continue
+                    else:
+                        break
+
+                rval.append(sock)
+
+            return rval
+
+    def lock(self):
+        return self._lock
+
+    def testStart(self, test):
+        with self._lock:
+            self._output_handler.testStart(test)
+
+    def testCommand(self, test, cmdline):
+        with self._lock:
+            self._output_handler.testCommand(test, cmdline)
+
+    def testProgress(self, test, msg):
+        with self._lock:
+            self._output_handler.testProgress(test, msg)
+
+    def testSucceeded(self, test):
+        test.parseProgress()
+
+        msg = "ok"
+
+        if test.known_failure:
+            msg += " (but expected to fail)"
+
+        msg += test.timePostfix()
+
+        with self._lock:
+            if test.reruns == 0:
+                self._succeeded.value += 1
+                self._output_handler.testSucceeded(test, msg)
+            else:
+                self._failed.value -= 1
+                if test.known_failure:
+                    self._failed_expected.value -= 1
+
+                self._unstable.value += 1
+                msg += f" on retry #{test.reruns}, unstable"
+                self._output_handler.testUnstable(test, msg)
+
+            self._output_handler.testFinished(test, msg)
+
+    def testFailed(self, test):
+        test.parseProgress()
+
+        msg = "failed"
+
+        if test.reruns > 0:
+            msg += f" on retry #{test.reruns}"
+
+        if test.known_failure:
+            msg += " (expected)"
+
+        msg += test.timePostfix()
+
+        with self._lock:
+            self._output_handler.testFailed(test, msg)
+            self._output_handler.testFinished(test, msg)
+
+            if test.reruns == 0:
+                self._failed.value += 1
+
+                if test.known_failure:
+                    self._failed_expected.value += 1
+                else:
+                    self._failed_tests += [test.name]
+
+            if test.reruns < Options.retries and not test.known_failure:
+                self.rerun(test)
+
+    def testSkipped(self, test):
+        msg = "not available, skipped"
+
+        with self._lock:
+            self._output_handler.testSkipped(test, msg)
+            self._skipped.value += 1
+
+    def testReplayOutput(self, test):
+        with self._lock:
+            self._output_handler.replayOutput(test)
+
+    def testTimingBaseline(self, test):
+        return self._timing.get(test.name, -1)
+
+    # Returns the name of the file to store the timing baseline in for this host.
+    def timingPath(self):
+        id = uuid.uuid3(uuid.NAMESPACE_DNS, str(uuid.getnode()))
+        return os.path.abspath(os.path.join(BaselineTimingDir, id.hex))
+
+    # Loads baseline timing information for this host if available. Returns
+    # empty directory if not.
+    def loadTiming(self):
+        timing = {}
+
+        with self._lock:
+            path = self.timingPath()
+
+            if not os.path.exists(path):
+                return {}
+
+            for line in open(path):
+                (k, v) = line.split()
+                timing[k] = float(v)
+
+        return timing
+
+    # Updates the timing baseline for the given tests on this host.
+    def saveTiming(self, tests):
+        with self._lock:
+            changed = False
+            timing = self.loadTiming()
+
+            for t in tests:
+                if t and t.measure_time and t.utime >= 0:
+                    changed = True
+                    timing[t.name] = t.utime
+
+            if not changed:
+                return
+
+            path = self.timingPath()
+            (dir, base) = os.path.split(path)
+            mkdir(dir)
+
+            out = open(path, "w")
+
+            for k, v in timing.items():
+                print(f"{k} {v}", file=out)
+
+            out.close()
+
+
+class CmdLine:
+    """A single command to invoke.
+
+    These commands can be provided by @TEST-{EXEC,REQUIRES} instructions, an
+    Initializer, Finalizer, or Teardown, or their part-specific equivalents.
+    """
+
+    def __init__(self, cmdline, expect_success, part, file):
+        self.cmdline = cmdline
+        self.expect_success = expect_success
+        self.part = part
+        self.file = file
+
+
+class CmdSeq:
+    """A sequence of commands, with potential subsequent teardown.
+
+    Tracking the teardown separately allows us to skip to it when commands
+    fail. Commands can be invidual CmdLines or CmdSeq instances. Test.run()
+    processes the latter recursively.
+    """
+
+    def __init__(self):
+        self.cmds = []  # CmdLine or CmdSeq instances
+        self.teardown = None
+
+
+# One test.
+class Test:
+    def __init__(self, file=None, directory=None):  # Allow dir to be directly defined
+        if file is not None:
+            self.dir = normalize_path(os.path.dirname(file))
+        else:
+            self.dir = normalize_path(directory)
+
+        self.alternative = None
+        self.baselines = []
+        self.basename = None
+        self.bound_ports = []
+        self.cloned = False
+        self.cmdseqs = []
+        self.contents = []
+        self.copy_files = []
+        self.diag = None
+        self.diagmsgs = []
+        self.doc = []
+        self.files = []
+        self.groups = set()
+        self.ignore_alternatives = []
+        self.include_alternatives = []
+        self.known_failure = False
+        self.log = None
+        self.measure_time = False
+        self.mgr = None
+        self.monitor = None
+        self.monitor_quit = None
+        self.name = None
+        self.number = 1
+        self.part = -1
+        self.ports = set()
+        self.progress_lock = None
+        self.requires = []
+        self.reruns = 0
+        self.serialize = []
+        self.start = None
+        self.stdout = None
+        self.stderr = None
+        self.tmpdir = None
+        self.utime = -1
+        self.utime_base = -1
+        self.utime_exceeded = False
+        self.utime_perc = 0.0
+        self.verbose = None
+
+    def __lt__(self, value):
+        return self.name and value.name and self.name < value.name
+
+    def serialize_hash(self):
+        if not self.serialize:
+            return 0
+
+        return int(binascii.crc32(self.serialize.encode("utf-8")))
+
+    def displayName(self):
+        name = self.name
+
+        if self.alternative:
+            name = f"{name} [{self.alternative}]"
+
+        return name
+
+    def setAlternative(self, alternative):
+        self.alternative = alternative
+
+    # Parse the test's content.
+    def parse(self, content, file):
+        cmds = {}
+        for line in content:
+            m = RE_IGNORE.search(line)
+            if m:
+                # Ignore this file.
+                return False
+
+            for tag, regexp, multiple, optional, group1, group2 in Commands:
+                m = regexp.search(line)
+
+                if m:
+                    value = None
+
+                    if group1 >= 0:
+                        value = m.group(group1)
+
+                    if group2 >= 0:
+                        value = (value, m.group(group2))
+
+                    if not multiple:
+                        if tag in cmds:
+                            error(f"{file}: {tag} defined multiple times.")
+
+                        cmds[tag] = value
+
+                    else:
+                        try:
+                            cmds[tag] += [value]
+                        except KeyError:
+                            cmds[tag] = [value]
+
+        # Make sure all non-optional commands are there.
+        for tag, regexp, multiple, optional, group1, group2 in Commands:
+            if not optional and tag not in cmds:
+                if tag == "exec":
+                    error(
+                        f"{file}: mandatory keyword '@TEST-EXEC' or '@TEST-EXEC-FAIL' is missing."
+                    )
+                else:
+                    error(f"{file}: mandatory {tag} command not found.")
+
+        basename = file
+
+        part = 1
+        m = RE_PART.match(file)
+
+        if m:
+            basename = m.group(1)
+            part = int(m.group(2))
+
+        name = os.path.relpath(basename, TestBase)
+        (name, ext) = os.path.splitext(name)
+
+        name = name.replace(os.sep, ".")
+        while name.startswith("."):
+            name = name[1:]
+
+        self.name = name
+        self.part = part
+        self.basename = name
+        self.contents += [(file, content)]
+
+        seq = CmdSeq()
+
+        if PartInitializer:
+            seq.cmds.append(
+                CmdLine(
+                    f"{PartInitializer} {self.name}",
+                    True,
+                    part,
+                    "<PartInitializer>",
+                )
+            )
+
+        for cmd, success in cmds["exec"]:
+            seq.cmds.append(CmdLine(cmd.strip(), success != "-FAIL", part, file))
+
+        if PartFinalizer:
+            seq.cmds.append(
+                CmdLine(
+                    f"{PartFinalizer} {self.name}",
+                    True,
+                    part,
+                    "<PartFinalizer>",
+                )
+            )
+
+        if PartTeardown:
+            seq.teardown = CmdLine(
+                f"{PartTeardown} {self.name}", True, part, "<PartTeardown>"
+            )
+
+        self.cmdseqs.append(seq)
+
+        if "serialize" in cmds:
+            self.serialize = cmds["serialize"]
+
+        if "port" in cmds:
+            self.ports |= {cmd.strip() for cmd in cmds["port"]}
+
+        if "group" in cmds:
+            self.groups |= {cmd.strip() for cmd in cmds["group"]}
+
+        if "requires" in cmds:
+            for cmd in cmds["requires"]:
+                self.requires.append(CmdLine(cmd.strip(), True, part, file))
+
+        if "copy-file" in cmds:
+            self.copy_files += [cmd.strip() for cmd in cmds["copy-file"]]
+
+        if "alternative" in cmds:
+            self.include_alternatives = [cmd.strip() for cmd in cmds["alternative"]]
+
+        if "not-alternative" in cmds:
+            self.ignore_alternatives = [cmd.strip() for cmd in cmds["not-alternative"]]
+
+        if "known-failure" in cmds:
+            self.known_failure = True
+
+        if "measure-time" in cmds:
+            self.measure_time = True
+
+        if "doc" in cmds:
+            self.doc = cmds["doc"]
+
+        return True
+
+    # Copies all control information over to a new Test but replacing the test's
+    # content with a new one.
+    def clone(self, content=None, increment=True):
+        # Cloning the class like this ensures that the globals continue to exist in
+        # cloned object just as they are in the original object.
+        clone = self.__class__("")
+        clone.number = self.number
+        clone.basename = self.basename
+
+        if increment:
+            clone.number = self.number + 1
+            clone.name = f"{self.basename}-{clone.number}"
+        elif self.name:
+            clone.name = self.name
+
+        clone.requires = self.requires
+        clone.reruns = self.reruns
+        clone.serialize = self.serialize
+        clone.ports = self.ports
+        clone.groups = self.groups
+        clone.cmdseqs = self.cmdseqs
+        clone.known_failure = self.known_failure
+        clone.measure_time = self.measure_time
+        clone.doc = self.doc
+
+        if content:
+            assert len(self.contents) == 1
+            clone.contents = [(self.contents[0][0], content)]
+        else:
+            clone.contents = self.contents
+
+        clone.files = self.files
+        clone.dir = self.dir
+        self.cloned = True
+
+        return clone
+
+    def mergePart(self, part):
+        if self.cloned or part.cloned:
+            error(
+                f"cannot use @TEST-START-NEXT with tests split across parts ({self.basename})"
+            )
+
+        self.serialize += part.serialize
+        self.ports |= part.ports
+        self.groups |= part.groups
+        self.cmdseqs += part.cmdseqs
+        self.ignore_alternatives += part.ignore_alternatives
+        self.include_alternatives += part.include_alternatives
+        self.files += part.files
+        self.requires += part.requires
+        self.copy_files += part.copy_files
+        self.contents += part.contents
+        self.doc += part.doc
+        self.known_failure |= part.known_failure
+        self.measure_time |= part.measure_time
+
+    def getPorts(self, mgr, count):
+        if not count:
+            return []
+
+        attempts = 5
+
+        while True:
+            rval = mgr.getAvailablePorts(count)
+
+            if rval:
+                return rval
+
+            attempts -= 1
+
+            if attempts == 0:
+                error(f"failed to obtain {count} ports for test {self.name}")
+
+            warning(
+                f"failed to obtain {count} ports for test {self.name}, will try {attempts} more times"
+            )
+
+            time.sleep(15)
+
+    def run(self, mgr):
+        bound_sockets = self.getPorts(mgr, len(self.ports))
+        self.bound_ports = [s.getsockname()[1] for s in bound_sockets]
+
+        for bs in bound_sockets:
+            bs.close()
+
+        self.progress_lock = threading.Lock()
+        self.start = time.time()
+        self.mgr = mgr
+        mgr.testStart(self)
+
+        self.tmpdir = normalize_path_join(TmpDir, self.name)
+        self.diag = normalize_path_join(self.tmpdir, ".diag")
+        self.verbose = normalize_path_join(self.tmpdir, ".verbose")
+        self.baselines = []
+        for d in BaselineDirs:
+            self.baselines.append(normalize_path_join(d, self.name))
+        self.diagmsgs = []
+        self.utime = -1
+        self.utime_base = self.mgr.testTimingBaseline(self)
+        self.utime_perc = 0.0
+        self.utime_exceeded = False
+
+        self.rmTmp()
+        mkdir(self.tmpdir)
+
+        for d in self.baselines:
+            mkdir(d)
+
+        for fname, lines in self.files:
+            fname = os.path.join(self.tmpdir, fname)
+
+            subdir = os.path.dirname(fname)
+
+            if subdir != "":
+                mkdir(subdir)
+            try:
+                ffile = open(fname, "w", newline="\n")
+            except OSError:
+                error(f"cannot write test's additional file '{fname}'")
+
+            for line in lines:
+                ffile.write(line)
+
+            ffile.close()
+
+        for file in self.copy_files:
+            src = replaceEnvs(file)
+            try:
+                shutil.copy2(src, self.tmpdir)
+            except OSError as e:
+                error(f"cannot copy {src}: {e}")
+
+        for file, content in self.contents:
+            localfile = normalize_path_join(self.tmpdir, os.path.basename(file))
+            out = open(localfile, "w", encoding="utf-8", newline="\n")
+
+            try:
+                for line in content:
+                    out.write(line)
+            except UnicodeEncodeError as e:
+                error(f"unicode encode error in file {localfile}: {e}")
+
+            out.close()
+
+        self.log = open(os.path.join(self.tmpdir, ".log"), "w", encoding="utf-8")
+
+        # These file handles are given to child processes as stdout/stderr
+        # when executing CmdLine instances. In fact, just the underlying fd
+        # is used as stdout/stderr of the child (see subprocess.py).
+        # Therefore, we do neither control nor can we assume any encoding
+        # the child process may produce. Consequently, care has to be taken
+        # reading these files. So, while not strictly necessary, open them
+        # in binary mode for documentation purposes.
+        self.stdout = open(os.path.join(self.tmpdir, ".stdout"), "ab")
+        self.stderr = open(os.path.join(self.tmpdir, ".stderr"), "ab")
+
+        for cmd in self.requires:
+            (success, rc) = self.execute(cmd, apply_alternative=self.alternative)
+
+            if not success:
+                self.mgr.testSkipped(self)
+                if not Options.tmps:
+                    self.rmTmp(with_close=True)
+                self.finish()
+                return
+
+        # Spawn thread that monitors for progress updates.
+        # Note: We do indeed spawn a thread here, not a process, so
+        # that the callback can modify the test object to maintain
+        # state.
+        def monitor_cb():
+            while not self.monitor_quit.is_set():
+                self.parseProgress()
+                time.sleep(0.1)
+
+        self.monitor = threading.Thread(target=monitor_cb, daemon=True)
+        self.monitor_quit = threading.Event()
+        self.monitor.start()
+
+        # Run test's commands. First, construct a series of command sequences:
+        # each sequence consists of test commands with an optional teardown that
+        # always runs, regardless of prior test failures.
+
+        seq = CmdSeq()
+
+        if Initializer:
+            seq.cmds.append(
+                CmdLine(f"{Initializer} {self.name}", True, 1, "<Initializer>")
+            )
+
+        seq.cmds += self.cmdseqs
+
+        if Finalizer:
+            seq.cmds.append(CmdLine(f"{Finalizer} {self.name}", True, 1, "<Finalizer>"))
+
+        if Teardown:
+            seq.teardown = CmdLine(f"{Teardown} {self.name}", True, 1, "<Teardown>")
+
+        failures = 0
+        rc = 0
+
+        # Executes the provided Cmdseq command sequence. Helper function, so we
+        # can recurse when a Cmdseq's command list includes other sequences.
+        def run_cmdseq(seq):
+            nonlocal failures, rc
+            need_teardown = False
+
+            # Run commands only when successful so far, if the most recent
+            # command asked to continue despite error (code 100), or in Sphinx
+            # mode.
+            if failures == 0 or rc == 100 or Options.sphinx:
+                skip_part = -1
+
+                for cmd in seq.cmds:
+                    # If the next command is a CmdSeq, process it recursively
+                    # first. This processes teardowns for those sequences as
+                    # needed, and skips them when nothing was actually run in a
+                    # CmdSeq.
+                    #
+                    # The use of isinstance() to determine "is a CmdSeq" is
+                    # dangerous since e.g. the dill serializer creates a
+                    # different type upon un-serializing, failing
+                    # isinstance(). So we take the class name as a sufficent
+                    # signal.
+                    if type(cmd).__name__ == "CmdSeq":
+                        need_teardown |= run_cmdseq(cmd)
+                        continue
+
+                    if skip_part >= 0 and skip_part == cmd.part:
+                        continue
+
+                    (success, rc) = self.execute(
+                        cmd, apply_alternative=self.alternative
+                    )
+                    need_teardown = True
+
+                    if not success:
+                        failures += 1
+
+                        if Options.sphinx:
+                            # We still execute the remaining commands and
+                            # raise a failure for each one that fails.
+                            self.mgr.testFailed(self)
+                            skip_part = cmd.part
+                            continue
+
+                        if failures == 1:
+                            self.mgr.testFailed(self)
+
+                        if rc != 100:
+                            break
+
+            if need_teardown and seq.teardown:
+                (success, teardown_rc) = self.execute(
+                    seq.teardown,
+                    apply_alternative=self.alternative,
+                    addl_envs={
+                        "TEST_FAILED": int(failures > 0),
+                        "TEST_LAST_RETCODE": rc,
+                    },
+                )
+
+                # A teardown can fail an otherwise successful test run, with the
+                # same special-casing of return codes 100 and 200. When failing
+                # on top of an already failing run, the return code will
+                # override the previous one. If a failing teardown wants to
+                # preserve the run's existing failing error code, it has access
+                # to it via the TEST_LAST_RETCODE environment variable.
+                if not success:
+                    rc = teardown_rc
+                    failures += 1
+
+                    if Options.sphinx or failures == 1:
+                        self.mgr.testFailed(self)
+
+            return need_teardown
+
+        run_cmdseq(seq)
+
+        # Return code 200 aborts further processing, now that any teardowns have
+        # run. btest-diff uses this code when we run with --update-interactive
+        # and the user aborts the run.
+        if rc == 200:
+            # Abort all tests.
+            self.monitor_quit.set()
+            # Flush remaining command output prior to exit:
+            mgr.testReplayOutput(self)
+            sys.exit(1)
+
+        self.utime_perc = 0.0
+        self.utime_exceeded = False
+
+        if failures == 0:
+            # If we don't have a timing baseline, we silently ignore that so that
+            # on systems that can't measure execution time, the test will just pass.
+            if self.utime_base >= 0 and self.utime >= 0:
+                delta = getOption("TimingDeltaPerc", "1.0")
+                self.utime_perc = (
+                    100.0 * (self.utime - self.utime_base) / self.utime_base
+                )
+                self.utime_exceeded = abs(self.utime_perc) > float(delta)
+
+            if self.utime_exceeded and not Options.update_times:
+                self.diagmsgs += [
+                    f"'{self.name}' exceeded permitted execution time deviation{self.timePostfix()}"
+                ]
+                self.mgr.testFailed(self)
+
+            else:
+                self.mgr.testSucceeded(self)
+
+            if not Options.tmps and self.reruns == 0:
+                self.rmTmp(with_close=True)
+
+        self.finish()
+
+    def finish(self):
+        if self.bound_ports:
+            self.mgr.returnPorts(list(self.bound_ports))
+
+        self.bound_ports = []
+
+        for d in self.baselines:
+            try:
+                # Try removing the baseline directory. If it works, it's empty,
+                # i.e., no baseline was created.
+                os.rmdir(d)
+            except OSError:
+                pass
+
+        self.log.close()
+        self.stdout.close()
+        self.stderr.close()
+
+        if self.monitor:
+            self.monitor_quit.set()
+            self.monitor.join()
+
+    def execute(self, cmd, apply_alternative=None, addl_envs=None):
+        filter_cmd = None
+        cmdline = cmd.cmdline
+        env = {}
+
+        # Apply alternative if requested.
+        if apply_alternative:
+            alt = Alternatives[apply_alternative]
+
+            try:
+                (path, executable) = os.path.split(cmdline.split()[0])
+                filter_cmd = alt.filters[executable]
+            except LookupError:
+                pass
+
+            for key, val in alt.substitutions.items():
+                cmdline = re.sub("\\b" + re.escape(key) + "\\b", val, cmdline)
+
+            env = alt.envs
+
+        localfile = normalize_path_join(self.tmpdir, os.path.basename(cmd.file))
+
+        # Do not apply filter if we expect failure.
+        if filter_cmd and cmd.expect_success:
+            # This is not quite correct as it does not necessarily need to be
+            # the %INPUT file which we are filtering ...
+            filtered = normalize_path_join(
+                self.tmpdir, f"filtered-{os.path.basename(localfile)}"
+            )
+
+            filter = CmdLine(
+                f"{filter_cmd} {localfile} {filtered}", True, 1, "<Filter>"
+            )
+
+            (success, rc) = self.execute(filter, apply_alternative=None)
+            if not success:
+                return (False, rc)
+
+            mv = CmdLine(f"mv {filtered} {localfile}", True, 1, "<Filter-Move>")
+            (success, rc) = self.execute(mv, apply_alternative=None)
+
+            if not success:
+                return (False, rc)
+
+        self.mgr.testCommand(self, cmd)
+
+        # Replace special names.
+
+        if localfile:
+            cmdline = RE_INPUT.sub(localfile, cmdline)
+
+        cmdline = RE_DIR.sub(self.dir, cmdline)
+
+        print(
+            f"{cmdline}: (expect {'success' if cmd.expect_success else 'failure'})",
+            file=self.log,
+        )
+
+        # Additional environment variables provided by the caller override any
+        # existing ones, but are generally not assumed to collide:
+        if addl_envs:
+            env.update(addl_envs)
+
+        env = self.prepareEnv(cmd, env)
+        measure_time = self.measure_time and (
+            Options.update_times or self.utime_base >= 0
+        )
+
+        (success, rc, utime) = runTestCommandLine(
+            cmdline,
+            measure_time,
+            cwd=self.tmpdir,
+            shell=True,
+            env=env,
+            stderr=self.stderr,
+            stdout=self.stdout,
+        )
+
+        if utime > 0:
+            self.utime += utime
+
+        if success:
+            if cmd.expect_success:
+                return (True, rc)
+
+            self.diagmsgs += [f"'{cmdline}' succeeded unexpectedly (exit code 0)"]
+            return (False, 0)
+
+        else:
+            if not cmd.expect_success:
+                return (True, rc)
+
+            self.diagmsgs += [f"'{cmdline}' failed unexpectedly (exit code {rc})"]
+            return (False, rc)
+
+    def rmTmp(self, *, with_close=False):
+        if with_close:
+            self.log.close()
+            self.stdout.close()
+            self.stderr.close()
+
+        try:
+            if os.path.isfile(self.tmpdir):
+                os.remove(self.tmpdir)
+
+            if os.path.isdir(self.tmpdir):
+                subprocess.call(["rm", "-rf", self.tmpdir], stderr=subprocess.DEVNULL)
+
+        except OSError as e:
+            error(f"cannot remove tmp directory {self.tmpdir}: {e}")
+
+    # Prepares the environment for the child processes.
+    def prepareEnv(self, cmd, addl=None):
+        if addl is None:
+            addl = {}
+        env = copy.deepcopy(os.environ)
+
+        env["TEST_BASELINE"] = os.pathsep.join(self.baselines)
+        env["TEST_DIAGNOSTICS"] = self.diag
+        env["TEST_MODE"] = Options.mode.upper()
+        env["TEST_NAME"] = self.name
+        env["TEST_VERBOSE"] = self.verbose
+        env["TEST_PART"] = str(cmd.part)
+        env["TEST_BASE"] = TestBase
+
+        for key, val in addl.items():
+            # Environment variables with a leading "-" are to be
+            # removed from the environment.
+            if key.startswith("-"):
+                try:
+                    env.pop(key[1:])
+                except KeyError:
+                    pass
+            else:
+                # Convert val to string since otherwise os.environ (and our clone)
+                # trigger a TypeError upon insertion, and the caller may be unaware.
+                env[key] = str(val)
+
+        for idx, key in enumerate(sorted(self.ports)):
+            env[key] = str(self.bound_ports[idx]) + "/tcp"
+
+        return env
+
+    def addFiles(self, files):
+        # files is a list of tuple (fname, lines).
+        self.files = files
+
+    # If timing information is requested and available returns a
+    # string that summarizes the time spent for the test.
+    # Otherwise, returns an empty string.
+    def timePostfix(self):
+        if self.utime_base >= 0 and self.utime >= 0:
+            return f" ({self.utime_perc:+.1f}%)"
+        else:
+            return ""
+
+    # Picks up any progress output that has a test has written out.
+    def parseProgress(self):
+        with self.progress_lock:
+            path = os.path.join(self.tmpdir, ".progress.*")
+            for file in sorted(glob.glob(path)):
+                try:
+                    for line in open(file):
+                        msg = line.strip()
+                        self.mgr.testProgress(self, msg)
+
+                    os.unlink(file)
+                except OSError:
+                    pass
+
+
+### Output handlers.
+
+
+class OutputHandler:
+    def __init__(self, options, outfile=sys.__stderr__):
+        """Base class for reporting progress and results to user. We derive
+        several classes from this one, with the one being used depending on
+        which output the users wants.
+
+        A handler's method are called from test TestMgr and may be called
+        interleaved from different tests. However, the TestMgr locks before
+        each call so that it's guaranteed that two calls don't run
+        concurrently.
+
+        options: An optparser with the global options.
+
+        outfile: The destination file object to write output to.
+        """
+        self._buffered_output = {}
+        self._options = options
+        self._outfile = outfile
+
+    def prepare(self, mgr):
+        """The TestManager calls this with itself as an argument just before
+        it starts running tests."""
+        pass
+
+    def options(self):
+        """Returns the current optparser instance."""
+        return self._options
+
+    def threadPrefix(self):
+        """With multiple threads, returns a string with the thread's name in
+        a form suitable to prefix output with. With a single thread, returns
+        the empty string."""
+        if self.options().threads > 1:
+            # TestManager.run() defines the process names to "#<n>".  Align the
+            # prefixes by using enough space for the number of threads
+            # requested, plus 1 for "#".
+            width = len(str(self.options().threads)) + 1
+            return f"[{mp.current_process().name:>{width}}]"
+        else:
+            return ""
+
+    def _output(self, msg, nl=True, file=None):
+        if not file:
+            file = reopen_std_file(self._outfile)
+
+        if nl:
+            print(msg, file=file)
+        else:
+            if msg:
+                print(msg, end=" ", file=file)
+
+    def output(self, test, msg, nl=True, file=None):
+        """Output one line of output to user. Unless we're just using a single
+        thread, this will be buffered until the test has finished;
+        then all output is printed as a block.
+
+        This should only be called from other members of this class, or
+        derived classes, not from tests.
+        """
+        if self.options().threads < 2:
+            self._output(msg, nl, file)
+            return
+
+        try:
+            self._buffered_output[test.name] += [(msg, nl, file)]
+        except KeyError:
+            self._buffered_output[test.name] = [(msg, nl, file)]
+
+    def replayOutput(self, test):
+        """Prints out all output buffered in threaded mode by output()."""
+        if test.name not in self._buffered_output:
+            return
+
+        for msg, nl, file in self._buffered_output[test.name]:
+            self._output(msg, nl, file)
+
+        self._buffered_output[test.name] = []
+
+    # Methods to override.
+    def testStart(self, test):
+        """Called just before a test begins."""
+
+    def testCommand(self, test, cmdline):
+        """Called just before a command line is executed for a trace."""
+
+    def testProgress(self, test, msg):
+        """Called when a test signals having made progress."""
+
+    def testSucceeded(self, test, msg):
+        """Called when a test was successful."""
+
+    def testFailed(self, test, msg):
+        """Called when a test failed."""
+
+    def testSkipped(self, test, msg):
+        """Called when a test is skipped because its dependencies aren't met."""
+
+    def testFinished(self, test, msg):
+        """
+        Called just after a test has finished being processed, independent of
+        success or failure. Not called for skipped tests.
+        """
+
+    def testUnstable(self, test, msg):
+        """Called when a test failed initially but succeeded in a retry."""
+
+    def finished(self):
+        """Called when all tests have been executed."""
+
+
+class Forwarder(OutputHandler):
+    """
+    Forwards output to several other handlers.
+
+    options: An optparser with the global options.
+
+    handlers: List of output handlers to forward to.
+    """
+
+    def __init__(self, options, handlers):
+        OutputHandler.__init__(self, options)
+        self._handlers = handlers
+
+    def prepare(self, mgr):
+        """Called just before test manager starts running tests."""
+        for h in self._handlers:
+            h.prepare(mgr)
+
+    def testStart(self, test):
+        """Called just before a test begins."""
+        for h in self._handlers:
+            h.testStart(test)
+
+    def testCommand(self, test, cmdline):
+        """Called just before a command line is executed for a trace."""
+        for h in self._handlers:
+            h.testCommand(test, cmdline)
+
+    def testProgress(self, test, msg):
+        """Called when a test signals having made progress."""
+        for h in self._handlers:
+            h.testProgress(test, msg)
+
+    def testSucceeded(self, test, msg):
+        """Called when a test was successful."""
+        for h in self._handlers:
+            h.testSucceeded(test, msg)
+
+    def testFailed(self, test, msg):
+        """Called when a test failed."""
+        for h in self._handlers:
+            h.testFailed(test, msg)
+
+    def testSkipped(self, test, msg):
+        for h in self._handlers:
+            h.testSkipped(test, msg)
+
+    def testFinished(self, test, msg):
+        for h in self._handlers:
+            h.testFinished(test, msg)
+
+    def testUnstable(self, test, msg):
+        """Called when a test failed initially but succeeded in a retry."""
+        for h in self._handlers:
+            h.testUnstable(test, msg)
+
+    def replayOutput(self, test):
+        for h in self._handlers:
+            h.replayOutput(test)
+
+    def finished(self):
+        for h in self._handlers:
+            h.finished()
+
+
+class Standard(OutputHandler):
+    """
+    The default output handler, writing plain lines with test outcome.
+
+    Each test result is reported. For parallelized operation, the output
+    includes the thread number processing the test.
+    """
+
+    def testStart(self, test):
+        self.output(test, self.threadPrefix(), nl=False)
+        self.output(test, f"{test.displayName()} ...", nl=False)
+        test._std_nl = False
+
+    def testCommand(self, test, cmdline):
+        pass
+
+    def testProgress(self, test, msg):
+        """Called when a test signals having made progress."""
+        if not test._std_nl:
+            self.output(test, "")
+
+        self.output(test, "  - " + msg)
+        test._std_nl = True
+
+    def testSucceeded(self, test, msg):
+        sys.stdout.flush()
+        self.finalMsg(test, msg)
+
+    def testFailed(self, test, msg):
+        self.finalMsg(test, msg)
+
+    def testSkipped(self, test, msg):
+        self.finalMsg(test, msg)
+
+    def finalMsg(self, test, msg):
+        if test._std_nl:
+            self.output(test, self.threadPrefix(), nl=False)
+            self.output(test, f"{test.displayName()} ...", nl=False)
+
+        self.output(test, msg)
+
+    def testUnstable(self, test, msg):
+        self.finalMsg(test, msg)
+
+
+class Console(OutputHandler):
+    """
+    Output handler that writes colorful progress report to stdout.
+
+    This handler works well in settings that can handle coloring but not
+    cursor placement commands (for example because moving to the beginning of
+    the line overwrites other surrounding output); it's what the
+    ``--show-all`` output uses. In contrast, the *CompactConsole* handler uses
+    cursor placement in addition for a more space-efficient output.
+    """
+
+    Green = "\033[32m"
+    Red = "\033[31m"
+    Yellow = "\033[33m"
+    Gray = "\033[37m"
+    DarkGray = "\033[1;30m"
+    Normal = "\033[0m"
+
+    def __init__(self, options):
+        OutputHandler.__init__(self, options, reopen_std_file(sys.__stdout__))
+
+    def testStart(self, test):
+        msg = f"[{test.mgr.percentage():>3.0f}%] {test.displayName()} ..."
+        self.output(test, msg, nl=False)
+
+    def testProgress(self, test, msg):
+        """Called when a test signals having made progress."""
+        msg = self.DarkGray + f"({msg})" + self.Normal
+        self.output(test, msg)
+
+    def testSucceeded(self, test, msg):
+        if test.known_failure:
+            msg = self.Yellow + msg + self.Normal
+        else:
+            msg = self.Green + msg + self.Normal
+
+        self.output(test, msg)
+
+    def testFailed(self, test, msg):
+        if test.known_failure:
+            msg = self.Yellow + msg + self.Normal
+        else:
+            msg = self.Red + msg + self.Normal
+
+        self.output(test, msg)
+
+    def testUnstable(self, test, msg):
+        msg = self.Yellow + msg + self.Normal
+        self.output(test, msg)
+
+    def testSkipped(self, test, msg):
+        msg = self.Gray + msg + self.Normal
+        self.output(test, msg)
+
+
+class CompactConsole(Console):
+    """
+    Output handler that writes compact, colorful progress report to
+    stdout while also keeping the output compact by keeping
+    output only for failing tests.
+
+    This handler adds cursor mods and navigation to the coloring provided by
+    the Console class and hence needs settings that can handle both.
+    """
+
+    CursorOff = "\033[?25l"
+    CursorOn = "\033[?25h"
+    EraseToEndOfLine = "\033[2K"
+
+    def __init__(self, options):
+        Console.__init__(self, options)
+
+        def cleanup():
+            self._outfile.write(self.CursorOn)
+
+        atexit.register(cleanup)
+
+    def testStart(self, test):
+        test.console_last_line = None
+        self._consoleOutput(test, "", False)
+        self._outfile.write(self.CursorOff)
+
+    def testProgress(self, test, msg):
+        """Called when a test signals having made progress."""
+        msg = " " + self.DarkGray + f"({msg})" + self.Normal
+        self._consoleAugment(test, msg)
+
+    def testSucceeded(self, test, msg):
+        if test.known_failure:
+            msg = self.Yellow + msg + self.Normal
+        else:
+            msg = self.Green + msg + self.Normal
+
+        self._consoleOutput(test, msg, False)
+
+    def testFailed(self, test, msg):
+        if test.known_failure:
+            msg = self.Yellow + msg + self.Normal
+        else:
+            msg = self.Red + msg + self.Normal
+
+        self._consoleOutput(test, msg, True)
+
+    def testFinished(self, test, msg):
+        test.console_last_line = None
+
+    def testUnstable(self, test, msg):
+        msg = self.Yellow + msg + self.Normal
+        self._consoleOutput(test, msg, True)
+
+    def testSkipped(self, test, msg):
+        msg = self.Gray + msg + self.Normal
+        self._consoleOutput(test, msg, False)
+
+    def finished(self):
+        self._outfile.write(self.EraseToEndOfLine)
+        self._outfile.write("\r")
+        self._outfile.write(self.CursorOn)
+        self._outfile.flush()
+
+    def _consoleOutput(self, test, msg, sticky):
+        line = f"[{test.mgr.percentage():>3.0f}%] {test.displayName()} ..."
+
+        if msg:
+            line += " " + msg
+
+        test.console_last_line = line
+        self._consoleWrite(test, line, sticky)
+
+    def _consoleAugment(self, test, msg):
+        self._outfile.write(self.EraseToEndOfLine)
+        self._outfile.write(f" {msg.strip()}")
+        self._outfile.write(f"\r{test.console_last_line}")
+        self._outfile.flush()
+
+    def _consoleWrite(self, test, msg, sticky):
+        self._outfile.write(chr(27) + "[2K")
+        self._outfile.write(f"\r{msg.strip()}")
+
+        if sticky:
+            self._outfile.write("\n")
+            test.console_last_line = None
+
+        self._outfile.flush()
+
+
+class Brief(OutputHandler):
+    """Output handler for producing the brief output format."""
+
+    def testStart(self, test):
+        pass
+
+    def testCommand(self, test, cmdline):
+        pass
+
+    def testProgress(self, test, msg):
+        """Called when a test signals having made progress."""
+        pass
+
+    def testSucceeded(self, test, msg):
+        pass
+
+    def testFailed(self, test, msg):
+        self.output(test, self.threadPrefix(), nl=False)
+        self.output(test, f"{test.displayName()} ... {msg}")
+
+    def testUnstable(self, test, msg):
+        self.output(test, self.threadPrefix(), nl=False)
+        self.output(test, f"{test.displayName()} ... {msg}")
+
+    def testSkipped(self, test, msg):
+        pass
+
+
+class Verbose(OutputHandler):
+    """Output handler for producing the verbose output format."""
+
+    def testStart(self, test):
+        self.output(test, self.threadPrefix(), nl=False)
+        self.output(test, f"{test.displayName()} ...")
+
+    def testCommand(self, test, cmdline):
+        part = ""
+
+        if cmdline.part > 1:
+            part = f" [part #{cmdline.part}]"
+
+        self.output(test, self.threadPrefix(), nl=False)
+        self.output(test, f"  > {cmdline.cmdline}{part}")
+
+    def testProgress(self, test, msg):
+        """Called when a test signals having made progress."""
+        self.output(test, "  - " + msg)
+
+    def testSucceeded(self, test, msg):
+        self.output(test, self.threadPrefix(), nl=False)
+        self.showTestVerbose(test)
+        self.output(test, f"... {test.displayName()} {msg}")
+
+    def testFailed(self, test, msg):
+        self.output(test, self.threadPrefix(), nl=False)
+        self.showTestVerbose(test)
+        self.output(test, f"... {test.displayName()} {msg}")
+
+    def testUnstable(self, test, msg):
+        self.output(test, self.threadPrefix(), nl=False)
+        self.showTestVerbose(test)
+        self.output(test, f"... {test.displayName()} {msg}")
+
+    def testSkipped(self, test, msg):
+        self.output(test, self.threadPrefix(), nl=False)
+        self.showTestVerbose(test)
+        self.output(test, f"... {test.displayName()} {msg}")
+
+    def showTestVerbose(self, test):
+        if not os.path.exists(test.verbose):
+            return
+
+        for line in open(test.verbose):
+            self.output(test, f"  > [test-verbose] {line.strip()}")
+
+
+class Diag(OutputHandler):
+    def __init__(self, options, all=False, file=None):
+        """Output handler for producing the diagnostic output format.
+
+        options: An optparser with the global options.
+
+        all: Print diagnostics also for succeeding tests.
+
+        file: Output into given file rather than console.
+        """
+        OutputHandler.__init__(self, options)
+        self._all = all
+        self._file = file
+
+    def showDiag(self, test):
+        """Generates diagnostics for a test."""
+        for line in test.diagmsgs:
+            self.output(test, "  % " + line, True, self._file)
+
+        for f in (test.diag, os.path.join(test.tmpdir, ".stderr")):
+            if not f:
+                continue
+
+            if os.path.isfile(f):
+                self.output(test, "  % cat " + os.path.basename(f), True, self._file)
+                for line in open(f, encoding="utf-8", errors="backslashreplace"):
+                    self.output(test, "  " + line.rstrip(), True, self._file)
+                self.output(test, "", True, self._file)
+
+        if self.options().wait and not self._file:
+            self.output(test, "<Enter> ...")
+            try:
+                sys.stdin.readline()
+            except KeyboardInterrupt:
+                sys.exit(1)
+
+    def testCommand(self, test, cmdline):
+        pass
+
+    def testSucceeded(self, test, msg):
+        if self._all:
+            if self._file:
+                self.output(test, f"{test.displayName()} ... {msg}", True, self._file)
+
+            self.showDiag(test)
+
+    def testFailed(self, test, msg):
+        if self._file:
+            self.output(test, f"{test.displayName()} ... {msg}", True, self._file)
+
+        if (not test.known_failure) or self._all:
+            self.showDiag(test)
+
+    def testUnstable(self, test, msg):
+        if self._file:
+            self.output(test, f"{test.displayName()} ... {msg}", True, self._file)
+
+    def testSkipped(self, test, msg):
+        if self._file:
+            self.output(test, f"{test.displayName()} ... {msg}", True, self._file)
+
+
+class SphinxOutput(OutputHandler):
+    def __init__(self, options, all=False, file=None):
+        """Output handler for producing output when running from
+        Sphinx. The main point here is that we save all diagnostic output to
+        $BTEST_RST_OUTPUT.
+
+        options: An optparser with the global options.
+        """
+        OutputHandler.__init__(self, options)
+
+        self._output = None
+        self._part = None
+
+        try:
+            self._rst_output = os.environ["BTEST_RST_OUTPUT"]
+        except KeyError:
+            print(
+                "warning: environment variable BTEST_RST_OUTPUT not set, will not produce output",
+                file=sys.stderr,
+            )
+            self._rst_output = None
+
+    def testStart(self, test):
+        self._output = None
+
+    def testCommand(self, test, cmdline):
+        if not self._rst_output:
+            return
+
+        self._output = f"{self._rst_output}#{cmdline.part}"
+        self._part = cmdline.part
+
+    def testSucceeded(self, test, msg):
+        pass
+
+    def testFailed(self, test, msg):
+        if not self._output:
+            return
+
+        out = open(self._output, "a", newline="\n")
+
+        print("\n.. code-block:: none ", file=out)
+        print(
+            f"\n  ERROR executing test '{test.displayName()}' (part {self._part})\n",
+            file=out,
+        )
+
+        for line in test.diagmsgs:
+            print("  % " + line, file=out)
+
+        test.diagmsgs = []
+
+        for f in (test.diag, os.path.join(test.tmpdir, ".stderr")):
+            if not f:
+                continue
+
+            if os.path.isfile(f):
+                print("  % cat " + os.path.basename(f), file=out)
+                for line in open(
+                    f, newline="\n", encoding="utf-8", errors="backslashreplace"
+                ):
+                    print(f"   {line.strip()}", file=out)
+                print(file=out)
+
+    def testUnstable(self, test, msg):
+        pass
+
+    def testSkipped(self, test, msg):
+        pass
+
+
+class XMLReport(OutputHandler):
+    RESULT_PASS = "pass"
+    RESULT_FAIL = "failure"
+    RESULT_SKIP = "skipped"
+    RESULT_UNSTABLE = "unstable"
+
+    def __init__(self, options, xmlfile):
+        """Output handler for producing an XML report of test results.
+
+        options: An optparser with the global options.
+
+        file: Output into given file
+        """
+        OutputHandler.__init__(self, options)
+        self._file = xmlfile
+        self._start = time.time()
+        self._timestamp = datetime.now().isoformat()
+        self._results = None
+
+    def prepare(self, mgr):
+        self._results = mgr.list([])
+
+    def testStart(self, test):
+        pass
+
+    def testCommand(self, test, cmdline):
+        pass
+
+    @staticmethod
+    def makeTestCaseElement(doc, testsuite, name, duration):
+        parts = name.split(".")
+        if len(parts) > 1:
+            classname = ".".join(parts[:-1])
+            name = parts[-1]
+        else:
+            classname = parts[0]
+            name = parts[0]
+
+        e = doc.createElement("testcase")
+        e.setAttribute("classname", classname)
+        e.setAttribute("name", name)
+        e.setAttribute("time", str(duration))
+        testsuite.appendChild(e)
+
+        return e
+
+    @staticmethod
+    def getContext(test, context_file):
+        context = ""
+        for line in test.diagmsgs:
+            context += "  % " + line + "\n"
+
+        for f in (test.diag, os.path.join(test.tmpdir, context_file)):
+            if not f:
+                continue
+
+            if os.path.isfile(f):
+                context += "  % cat " + os.path.basename(f) + "\n"
+                for line in open(
+                    f, newline="\n", encoding="utf-8", errors="backslashreplace"
+                ):
+                    context += "  " + line.strip() + "\n"
+
+        return context
+
+    def addTestResult(self, test, status):
+        context = ""
+
+        if status != self.RESULT_PASS:
+            context = self.getContext(test, ".stderr")
+
+        res = {
+            "name": test.displayName(),
+            "status": status,
+            "context": context,
+            "duration": time.time() - test.start,
+        }
+
+        self._results.append(res)
+
+    def testSucceeded(self, test, msg):
+        self.addTestResult(test, self.RESULT_PASS)
+
+    def testFailed(self, test, msg):
+        self.addTestResult(test, self.RESULT_FAIL)
+
+    def testUnstable(self, test, msg):
+        self.addTestResult(test, self.RESULT_UNSTABLE)
+
+    def testSkipped(self, test, msg):
+        self.addTestResult(test, self.RESULT_SKIP)
+
+    def finished(self):
+        num_tests = 0
+        num_failures = 0
+        doc = xml.dom.minidom.Document()
+        testsuite = doc.createElement("testsuite")
+        doc.appendChild(testsuite)
+
+        for res in self._results:
+            test_case = self.makeTestCaseElement(
+                doc, testsuite, res["name"], res["duration"]
+            )
+
+            if res["status"] != self.RESULT_PASS:
+                e = doc.createElement(res["status"])
+                e.setAttribute("type", res["status"])
+                text_node = doc.createTextNode(res["context"])
+                e.appendChild(text_node)
+                test_case.appendChild(e)
+
+                if res["status"] == self.RESULT_FAIL:
+                    num_failures += 1
+
+            num_tests += 1
+
+        # These attributes are set in sorted order so that resulting XML output
+        # is stable across Python versions.  Before Python 3.8, attributes
+        # appear in sorted order.  After Python 3.8, attributes appear in
+        # order specified by the user.  Would be best to use an XML canonifier
+        # method here and Python 3.8+ does provide one, except earlier versions
+        # would need to rely on a third-party lib to do the same. References:
+        #   https://bugs.python.org/issue34160
+        #   https://mail.python.org/pipermail/python-dev/2019-March/156709.html
+        testsuite.setAttribute("errors", str(0))
+        testsuite.setAttribute("failures", str(num_failures))
+        testsuite.setAttribute("hostname", socket.gethostname())
+        testsuite.setAttribute("tests", str(num_tests))
+        testsuite.setAttribute("time", str(time.time() - self._start))
+        testsuite.setAttribute("timestamp", self._timestamp)
+
+        print(doc.toprettyxml(indent="    "), file=self._file)
+        self._file.close()
+
+
+class ChromeTracing(OutputHandler):
+    """Output in Chrome tracing format.
+
+    Output files can be loaded into Chrome browser under about:tracing, or
+    converted to standalone HTML files with `trace2html`.
+    """
+
+    def __init__(self, options, tracefile):
+        OutputHandler.__init__(self, options)
+        self._file = tracefile
+        self._results = None
+
+    def prepare(self, mgr):
+        self._results = mgr.list([])
+
+    def testFinished(self, test, _):
+        self._results.append(
+            {
+                "name": test.name,
+                "ts": test.start * 1e6,
+                "tid": mp.current_process().pid,
+                "pid": 1,
+                "ph": "X",
+                "cat": "test",
+                "dur": (time.time() - test.start) * 1e6,
+            }
+        )
+
+    def finished(self):
+        print(json.dumps(list(self._results)), file=self._file)
+        self._file.close()
+
+
+def create_output_handler(options):
+    output_handlers = []
+
+    if options.verbose:
+        output_handlers += [Verbose(options)]
+
+    elif options.brief:
+        output_handlers += [Brief(options)]
+
+    else:
+        if sys.stdout.isatty():
+            if options.show_all:
+                output_handlers += [Console(options)]
+            else:
+                output_handlers += [CompactConsole(options)]
+        else:
+            output_handlers += [Standard(options)]
+
+    if options.diagall:
+        output_handlers += [Diag(options, True, None)]
+
+    elif options.diag:
+        output_handlers += [Diag(options, False, None)]
+
+    if options.diagfile:
+        try:
+            diagfile = open(options.diagfile, "w", 1, newline="\n")
+            output_handlers += [Diag(options, options.diagall, diagfile)]
+
+        except OSError as e:
+            print(f"cannot open {options.diagfile}: {e}", file=sys.stderr)
+
+    if options.sphinx:
+        if sys.platform == "win32":
+            print("Sphinx support is disabled on Windows", file=sys.stderr)
+            sys.exit(1)
+
+        output_handlers += [SphinxOutput(options)]
+
+    if options.xmlfile:
+        try:
+            xmlfile = open(options.xmlfile, "w", 1, newline="\n")
+            output_handlers += [XMLReport(options, xmlfile)]
+
+        except OSError as e:
+            print(f"cannot open {options.xmlfile}: {e}", file=sys.stderr)
+
+    if options.tracefile:
+        try:
+            tracefile = open(options.tracefile, "w", 1, newline="\n")
+            output_handlers += [ChromeTracing(options, tracefile)]
+
+        except OSError as e:
+            print(f"cannot open {options.tracefile}: {e}", file=sys.stderr)
+
+    return Forwarder(options, output_handlers)
+
+
+### Timing measurements.
+
+
+# Base class for all timers.
+class TimerBase:
+    # Returns true if time measurement are supported by this class on the
+    # current platform. Must be overidden by derived classes.
+    def available(self):
+        raise NotImplementedError("Timer.available not implemented")
+
+    # Runs a subprocess and measures its execution time. Arguments are as with
+    # runSubprocess. Return value is the same with runTestCommandLine(). This
+    # method must only be called if available() returns True. Must be overidden
+    # by derived classes.
+    def timeSubprocess(self, *args, **kwargs):
+        raise NotImplementedError("Timer.timeSubprocess not implemented")
+
+
+# Linux version of time measurements. Uses "perf".
+class LinuxTimer(TimerBase):
+    def __init__(self):
+        self.perf = getOption("PerfPath", which("perf"))
+
+    def available(self):
+        if not platform() == "Linux":
+            return False
+
+        if not self.perf or not os.path.exists(self.perf):
+            return False
+
+        # Make sure it works.
+        (success, rc) = runSubprocess(
+            f"{self.perf} stat -o /dev/null true 2>/dev/null", shell=True
+        )
+        return success and rc == 0
+
+    def timeSubprocess(self, *args, **kwargs):
+        assert self.perf
+
+        cargs = args
+        ckwargs = kwargs
+
+        # fmt: off
+        targs = [self.perf, "stat", "-o", ".timing", "-x", " ", "-e", "instructions", "sh", "-c"]
+        # fmt: on
+
+        targs += [" ".join(cargs)]
+        cargs = [targs]
+        del ckwargs["shell"]
+
+        (success, rc) = runSubprocess(*cargs, **ckwargs)
+
+        utime = -1
+
+        try:
+            cwd = kwargs["cwd"] if "cwd" in kwargs else "."
+            for line in open(os.path.join(cwd, ".timing")):
+                if "instructions" in line and "not supported" not in line:
+                    try:
+                        m = line.split()
+                        utime = int(m[0])
+                    except ValueError:
+                        pass
+
+        except OSError:
+            pass
+
+        return (success, rc, utime)
+
+
+# Walk the given directory and return all test files.
+def findTests(paths, expand_globs=False):
+    tests = []
+
+    ignore_files = getOption("IgnoreFiles", "").split()
+    ignore_dirs = getOption("IgnoreDirs", "").split()
+
+    expanded = set()
+
+    for p in paths:
+        p = os.path.join(TestBase, p)
+
+        if expand_globs:
+            for d in glob.glob(p):
+                if os.path.isdir(d):
+                    expanded.add(d)
+        else:
+            expanded.add(p)
+
+    for path in expanded:
+        rpath = os.path.relpath(path, TestBase)
+
+        if os.path.isdir(path) and os.path.basename(path) in ignore_dirs:
+            continue
+
+        ignores = [normalize_path_join(path, dir) for dir in ignore_dirs]
+
+        m = RE_PART.match(rpath)
+        if m:
+            error(
+                f"Do not specify files with part numbers directly, use the base test name ({rpath})"
+            )
+
+        if os.path.isfile(path):
+            tests += readTestFile(path)
+
+            # See if there are more parts.
+            for part in glob.glob(f"{rpath}#*"):
+                tests += readTestFile(part)
+
+        elif os.path.isdir(path):
+            for dirpath, dirnames, filenames in os.walk(path):
+                ign = os.path.join(dirpath, ".btest-ignore")
+
+                if os.path.isfile(os.path.join(ign)):
+                    del dirnames[0 : len(dirnames)]
+                    continue
+
+                for file in filenames:
+                    for gl in ignore_files:
+                        if fnmatch.fnmatch(file, gl):
+                            break
+                    else:
+                        tests += readTestFile(os.path.join(dirpath, file))
+
+                # Don't recurse into these.
+                for dir, dir_path in [
+                    (dir, normalize_path_join(dirpath, dir)) for dir in dirnames
+                ]:
+                    for skip in ignores:
+                        if dir_path == skip:
+                            dirnames.remove(dir)
+
+        else:
+            # See if we have test(s) named like this in our configured set.
+            found = False
+            for t in Config.configured_tests:
+                if t and rpath == t.name:
+                    tests += [t]
+                    found = True
+
+            if not found:
+                # See if there are parts.
+                for part in glob.glob(f"{rpath}#*"):
+                    tests += readTestFile(part)
+                    found = True
+
+                if not found:
+                    error(f"cannot read {path}")
+
+    return tests
+
+
+# Merge parts belonging to the same test into one.
+def mergeTestParts(tests):
+    def key(t):
+        return (t.basename, t.number, t.part)
+
+    out = {}
+
+    for t in sorted(tests, key=key):
+        try:
+            other = out[t.name]
+
+            assert t.part != other.part
+            out[t.name].mergePart(t)
+
+        except KeyError:
+            out[t.name] = t
+
+    return sorted(out.values(), key=key)
+
+
+# Read the given test file and instantiate one or more tests from it.
+def readTestFile(filename):
+    def newTest(content, previous):
+        if not previous:
+            t = Test(filename)
+            if t.parse(content, filename):
+                return t
+            else:
+                return None
+        else:
+            return previous.clone(content)
+
+    if os.path.basename(filename) == ".btest-ignore":
+        return []
+
+    try:
+        input = open(filename, encoding="utf-8", newline="")
+    except OSError as e:
+        error(f"cannot read test file: {e}")
+
+    tests = []
+    files = []
+
+    content = []
+    previous = None
+    file = (None, [])
+
+    state = "test"
+
+    try:
+        lines = list(input)
+    except UnicodeDecodeError as e:
+        # This error is caused by either a test file with an invalid UTF-8 byte
+        # sequence, or if python makes the wrong assumption about the encoding
+        # of a test file (this can happen if a test file has valid UTF-8 but
+        # none of the locale environment variables LANG, LC_CTYPE, or LC_ALL,
+        # were defined prior to running btest).  However, if all test files
+        # are ASCII, then this error should never occur.
+        error(f"unicode decode error in file {filename}: {e}")
+
+    for line in lines:
+        if state == "test":
+            m = RE_START_FILE.search(line)
+            if m:
+                state = "file"
+                file = (m.group(1), [])
+                continue
+
+            m = RE_END_FILE.search(line)
+            if m:
+                error(f"{filename}: unexpected {CommandPrefix}END-FILE")
+
+            m = RE_START_NEXT_TEST.search(line)
+            if not m:
+                content += [line]
+                continue
+
+            t = newTest(content, previous)
+            if not t:
+                return []
+
+            tests += [t]
+
+            previous = t
+            content = []
+
+        elif state == "file":
+            m = RE_END_FILE.search(line)
+            if m:
+                state = "test"
+                files += [file]
+                file = (None, [])
+                continue
+
+            file = (file[0], file[1] + [line])
+
+        else:
+            error(f"internal: unknown state {state}")
+
+    if state == "file":
+        files += [file]
+
+    input.close()
+
+    t = newTest(content, previous)
+    if t:
+        tests.append(t)
+
+    for t in tests:
+        if t:
+            t.addFiles(files)
+
+    return tests
+
+
+def jOption(option, _, __, parser):
+    val = mp.cpu_count()
+
+    if parser.rargs and not parser.rargs[0].startswith("-"):
+        try:
+            # Next argument should be the non-negative number of threads.
+            # Turn 0 into 1, for backward compatibility.
+            val = max(1, int(parser.rargs[0]))
+            parser.rargs.pop(0)
+        except ValueError:
+            # Default to using all CPUs. Flagging this as error risks
+            # confusing subsequent non-option arguments with arguments
+            # intended for -j.
+            pass
+
+    setattr(parser.values, option.dest, val)
+
+
+# Output markup language documenting tests.
+def outputDocumentation(tests, fmt):
+    def indent(i):
+        return "    " * i
+
+    def doc(t):
+        return t.doc if t.doc else ["No documentation."]
+
+    # The "sectionlist" ensures that sections are output in same order as
+    # they appear in the "tests" list.
+    sectionlist = []
+    sections = {}
+
+    for t in tests:
+        ids = t.name.split(".")
+        path = ".".join(ids[:-1])
+        if path not in sectionlist:
+            sectionlist.append(path)
+        s = sections.setdefault(path, [])
+        s.append(t)
+
+    for s in sectionlist:
+        tests = sections[s]
+
+        if fmt == "rst":
+            print(f"{s}")
+            print("-" * len(s))
+            print()
+
+            for t in tests:
+                print(f"{indent(1)}``{t.name}``:")
+                for d in doc(t):
+                    print(f"{indent(2)}{d}")
+                print()
+
+        if fmt == "md":
+            print(f"# {s}")
+            print()
+
+            for t in tests:
+                print(f"* `{t.name}`:")
+                for d in doc(t):
+                    print(f"{indent(1)}{d}")
+
+            print()
+
+
+def parse_options():
+    optparser = optparse.OptionParser(
+        usage="%prog [options] <directories>", version=VERSION
+    )
+    optparser.add_option(
+        "-U",
+        "--update-baseline",
+        action="store_const",
+        dest="mode",
+        const="UPDATE",
+        help="create a new baseline from the tests' output",
+    )
+    optparser.add_option(
+        "-u",
+        "--update-interactive",
+        action="store_const",
+        dest="mode",
+        const="UPDATE_INTERACTIVE",
+        help="interactively asks whether to update baseline for a failed test",
+    )
+    optparser.add_option(
+        "-d",
+        "--diagnostics",
+        action="store_true",
+        dest="diag",
+        default=False,
+        help="show diagnostic output for failed tests",
+    )
+    optparser.add_option(
+        "-D",
+        "--diagnostics-all",
+        action="store_true",
+        dest="diagall",
+        default=False,
+        help="show diagnostic output for ALL tests",
+    )
+    optparser.add_option(
+        "-f",
+        "--file-diagnostics",
+        action="store",
+        type="string",
+        dest="diagfile",
+        default="",
+        help=(
+            "write diagnostic output for failed tests into file; "
+            "if file exists, it is overwritten"
+        ),
+    )
+    optparser.add_option(
+        "-v",
+        "--verbose",
+        action="store_true",
+        dest="verbose",
+        default=False,
+        help="show commands as they are executed",
+    )
+    optparser.add_option(
+        "-w",
+        "--wait",
+        action="store_true",
+        dest="wait",
+        default=False,
+        help="wait for <enter> after each failed (with -d) or all (with -D) tests",
+    )
+    optparser.add_option(
+        "-b",
+        "--brief",
+        action="store_true",
+        dest="brief",
+        default=False,
+        help="outputs only failed tests",
+    )
+    optparser.add_option(
+        "-c",
+        "--config",
+        action="store",
+        type="string",
+        dest="config",
+        default=ConfigDefault,
+        help="configuration file",
+    )
+    optparser.add_option(
+        "-t",
+        "--tmp-keep",
+        action="store_true",
+        dest="tmps",
+        default=False,
+        help="do not delete tmp files created for running tests",
+    )
+    optparser.add_option(
+        "-j",
+        "--jobs",
+        action="callback",
+        callback=jOption,
+        dest="threads",
+        default=1,
+        help="number of threads running tests in parallel; with no argument will use all CPUs",
+    )
+    optparser.add_option(
+        "-g",
+        "--groups",
+        action="store",
+        type="string",
+        dest="groups",
+        default="",
+        help="execute only tests of given comma-separated list of groups",
+    )
+    optparser.add_option(
+        "-r",
+        "--rerun",
+        action="store_true",
+        dest="rerun",
+        default=False,
+        help="execute commands for tests that failed last time",
+    )
+    optparser.add_option(
+        "-q",
+        "--quiet",
+        action="store_true",
+        dest="quiet",
+        default=False,
+        help="suppress information output other than about failed tests",
+    )
+    optparser.add_option(
+        "-x",
+        "--xml",
+        action="store",
+        type="string",
+        dest="xmlfile",
+        default="",
+        help=(
+            "write a report of test results in JUnit XML format to file; "
+            "if file exists, it is overwritten"
+        ),
+    )
+    optparser.add_option(
+        "-a",
+        "--alternative",
+        action="store",
+        type="string",
+        dest="alternatives",
+        default=None,
+        help="activate given alternative",
+    )
+    optparser.add_option(
+        "-S",
+        "--sphinx",
+        action="store_true",
+        dest="sphinx",
+        default=False,
+        help="indicates that we're running from inside Sphinx; for internal purposes",
+    )
+    optparser.add_option(
+        "-T",
+        "--update-times",
+        action="store_true",
+        dest="update_times",
+        default=False,
+        help="create a new timing baseline for tests being measured",
+    )
+    optparser.add_option(
+        "-R",
+        "--documentation",
+        action="store",
+        type="choice",
+        dest="doc",
+        choices=("rst", "md"),
+        metavar="format",
+        default=None,
+        help="Output documentation for tests, supported formats: rst, md",
+    )
+    optparser.add_option(
+        "-A",
+        "--show-all",
+        action="store_true",
+        default=False,
+        help=(
+            "For console output, show one-liners for passing/skipped tests "
+            "in addition to any failing ones"
+        ),
+    )
+    optparser.add_option(
+        "-z",
+        "--retries",
+        action="store",
+        dest="retries",
+        type="int",
+        default=0,
+        help="Retry failed tests this many times to determine if they are unstable",
+    )
+    optparser.add_option(
+        "--trace-file",
+        action="store",
+        dest="tracefile",
+        default="",
+        help="write Chrome tracing file to file; if file exists, it is overwritten",
+    )
+    optparser.add_option(
+        "-F",
+        "--abort-on-failure",
+        action="store_true",
+        dest="abort_on_failure",
+        help="terminate after first test failure",
+    )
+    optparser.add_option(
+        "-l",
+        "--list",
+        action="store_true",
+        dest="list",
+        default=False,
+        help="list available tests instead of executing them",
+    )
+    optparser.add_option(
+        "-s",
+        "--set",
+        action="append",
+        dest="defaults",
+        default=[],
+        help=(
+            "Override default key used in btest.cfg with another value. "
+            "Can be specified multiple times."
+        ),
+    )
+    optparser.add_option(
+        "-i",
+        "--tests-file",
+        action="store",
+        type="string",
+        dest="tests_file",
+        default="",
+        help=("Load list of tests to execute from file."),
+    )
+
+    optparser.set_defaults(mode="TEST")
+
+    (options, parsed_args) = optparser.parse_args()
+
+    # Update-interactive mode implies single-threaded operation
+    if options.mode == "UPDATE_INTERACTIVE" and options.threads > 1:
+        warning("ignoring requested parallelism in interactive-update mode")
+        options.threads = 1
+
+    if not os.path.exists(options.config):
+        error(f"configuration file '{options.config}' not found")
+
+    return options, parsed_args
+
+
+### Main
+
+if __name__ == "__main__":
+    # Python 3.8+ on macOS no longer uses "fork" as the default start-method
+    # See https://github.com/zeek/btest/issues/26
+    pyver_maj = sys.version_info[0]
+    pyver_min = sys.version_info[1]
+
+    if sys.platform == "win32":
+        # The "fork" method doesn't exist at all on Windows, so force over to
+        # "spawn" instead.
+        mp.set_start_method("spawn")
+
+        # Double-check that `bash.exe` exists and is executable, since it's
+        # required for pretty much anything here to work on Windows. Note we're
+        # doing this prior to parsing the config file because it's required for
+        # backtick-expansion there as well.
+        try:
+            subprocess.call(
+                ["bash.exe", "--version"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except FileNotFoundError:
+            print(
+                "error: bash.exe is required to be in your PATH to run BTest.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+    elif (pyver_maj == 3 and pyver_min >= 8) or pyver_maj > 3:
+        mp.set_start_method("fork")
+
+    (Options, args) = parse_options()
+
+    # The defaults come from environment variables, plus a few additional items.
+    defaults = {}
+    # Changes to defaults should not change os.environ
+    defaults.update(os.environ)
+    defaults["default_path"] = os.environ["PATH"]
+
+    dirname = os.path.dirname(Options.config)
+    if not dirname:
+        dirname = os.getcwd()
+
+    # If the BTEST_TEST_BASE envirnoment var is set, we'll use that as the testbase.
+    # If not, we'll use the current directory.
+    TestBase = normalize_path(os.environ.get("BTEST_TEST_BASE", dirname))
+    defaults["testbase"] = TestBase
+    defaults["baselinedir"] = normalize_path(
+        os.environ.get("BTEST_BASELINE_DIR", os.path.join(TestBase, "Baseline"))
+    )
+    defaults["pathsep"] = os.pathsep
+
+    # Parse our config
+    Config = getcfgparser(defaults)
+    Config.read(Options.config, encoding="utf-8")
+
+    defaults["baselinedir"] = getOption("BaselineDir", defaults["baselinedir"])
+
+    min_version = getOption("MinVersion", None)
+    if min_version:
+        validate_version_requirement(min_version, VERSION)
+
+    if Options.alternatives:
+        # Preprocess to split into list. "-" refers to the default setup, as a
+        # shorthand for "default", to allow combination with select alternatives.
+        Options.alternatives = [alt.strip() for alt in Options.alternatives.split(",")]
+        Options.alternatives = [
+            Alternative.DEFAULT if alt == "-" else alt for alt in Options.alternatives
+        ]
+
+        # Helper function that, if an option wasn't explicitly specified as an
+        # environment variable, checks if an alternative sets its through
+        # its own environment section. If so, we make that value our new default.
+        # If multiple alternatives set it, we pick the value from the first.
+        def get_env_from_alternative(env, opt, default, transform=None):
+            for tag in Options.alternatives:
+                value = getOption(env, None, section=f"environment-{tag}")
+                if value is not None:
+                    if transform:
+                        value = transform(value)
+
+                    defaults[opt] = value
+
+                    # At this point, our defaults have changed, so we
+                    # reread the configuration.
+                    new_config = getcfgparser(defaults)
+                    new_config.read(Options.config)
+                    return new_config, value
+
+            return Config, default
+
+        (Config, TestBase) = get_env_from_alternative(
+            "BTEST_TEST_BASE",
+            "testbase",
+            TestBase,
+            lambda x: normalize_path(os.path.abspath(x)),
+        )
+        # Need to update BaselineDir - it may be interpolated from testbase.
+        defaults["baselinedir"] = normalize_path(
+            getOption("BaselineDir", defaults["baselinedir"])
+        )
+        (Config, _) = get_env_from_alternative(
+            "BTEST_BASELINE_DIR",
+            "baselinedir",
+            None,
+            transform=lambda x: normalize_path(x),
+        )
+
+    os.chdir(TestBase)
+
+    if Options.sphinx:
+        Options.quiet = True
+
+    if Options.quiet:
+        Options.brief = True
+
+    # Determine output handlers to use.
+
+    output_handler = create_output_handler(Options)
+
+    # Determine Timer to use.
+
+    Timer = None
+
+    if platform() == "Linux":
+        t = LinuxTimer()
+        if t.available():
+            Timer = t
+
+    if Options.update_times and not Timer:
+        warning("unable to create timing baseline because timer is not available")
+
+    # Evaluate other command line options.
+
+    if Config.has_section("environment"):
+        for name, value in Config.itemsNoDefaults("environment"):
+            # Here we don't want to include items from defaults
+            os.environ[name] = value
+
+    Alternatives = {}
+
+    if Options.alternatives:
+        for tag in Options.alternatives:
+            a = Alternative(tag)
+
+            try:
+                for name, value in Config.itemsNoDefaults(f"filter-{tag}"):
+                    a.filters[name] = value
+
+            except configparser.NoSectionError:
+                pass
+
+            try:
+                for name, value in Config.itemsNoDefaults(f"substitution-{tag}"):
+                    a.substitutions[name] = value
+
+            except configparser.NoSectionError:
+                pass
+
+            try:
+                for name, value in Config.itemsNoDefaults(f"environment-{tag}"):
+                    if name.startswith("-") and value.strip():
+                        error(
+                            f'expected empty value for "{name}" in section environment-{tag}'
+                        )
+
+                    a.envs[name] = value
+
+            except configparser.NoSectionError:
+                pass
+
+            if a.is_empty() and not a.is_default():
+                error(f'alternative "{tag}" is undefined')
+
+            Alternatives[tag] = a
+
+    CommandPrefix = getOption("CommandPrefix", "@TEST-")
+
+    RE_INPUT = re.compile(r"%INPUT")
+    RE_DIR = re.compile(r"%DIR")
+    RE_ENV = re.compile(r"\$\{(\w+)}")
+    RE_PART = re.compile(r"^(.*)#([0-9]+)$")
+    RE_IGNORE = re.compile(CommandPrefix + "IGNORE")
+    RE_START_NEXT_TEST = re.compile(CommandPrefix + "START-NEXT")
+    RE_START_FILE = re.compile(CommandPrefix + "START-FILE +([^\r\n ]*)")
+    RE_END_FILE = re.compile(CommandPrefix + "END-FILE")
+
+    # Commands as tuple (tag, regexp, more-than-one-is-ok, optional, group-main, group-add)
+    # pylint: disable=bad-whitespace
+    # fmt: off
+    RE_EXEC                = ("exec",            re.compile(CommandPrefix + "EXEC(-FAIL)?: *(.*)"), True, False, 2, 1)
+    RE_REQUIRES            = ("requires",        re.compile(CommandPrefix + "REQUIRES: *(.*)"), True, True, 1, -1)
+    RE_GROUP               = ("group",           re.compile(CommandPrefix + "GROUP: *(.*)"), True, True, 1, -1)
+    RE_SERIALIZE           = ("serialize",       re.compile(CommandPrefix + "SERIALIZE: *(.*)"), False, True, 1, -1)
+    RE_PORT                = ("port",            re.compile(CommandPrefix + "PORT: *(.*)"), True, True, 1, -1)
+    RE_INCLUDE_ALTERNATIVE = ("alternative",     re.compile(CommandPrefix + "ALTERNATIVE: *(.*)"), True, True, 1, -1)
+    RE_IGNORE_ALTERNATIVE  = ("not-alternative", re.compile(CommandPrefix + "NOT-ALTERNATIVE: *(.*)"), True, True, 1, -1)
+    RE_COPY_FILE           = ("copy-file",       re.compile(CommandPrefix + "COPY-FILE: *(.*)"), True, True, 1, -1)
+    RE_KNOWN_FAILURE       = ("known-failure",   re.compile(CommandPrefix + "KNOWN-FAILURE"), False, True, -1, -1)
+    RE_MEASURE_TIME        = ("measure-time",    re.compile(CommandPrefix + "MEASURE-TIME"), False, True, -1, -1)
+    RE_DOC                 = ("doc",             re.compile(CommandPrefix + "DOC: *(.*)"), True, True, 1, -1)
+    # fmt: on
+    # pylint: enable=bad-whitespace
+
+    Commands = (
+        RE_EXEC,
+        RE_REQUIRES,
+        RE_GROUP,
+        RE_SERIALIZE,
+        RE_PORT,
+        RE_INCLUDE_ALTERNATIVE,
+        RE_IGNORE_ALTERNATIVE,
+        RE_COPY_FILE,
+        RE_KNOWN_FAILURE,
+        RE_MEASURE_TIME,
+        RE_DOC,
+    )
+
+    StateFile = normalize_path(
+        getOption("StateFile", os.path.join(defaults["testbase"], ".btest.failed.dat"))
+    )
+    TmpDir = normalize_path(
+        getOption("TmpDir", os.path.join(defaults["testbase"], ".tmp"))
+    )
+    BaselineDirs = [
+        normalize_path(dir) for dir in defaults["baselinedir"].split(os.pathsep)
+    ]
+    BaselineTimingDir = normalize_path(
+        getOption("TimingBaselineDir", os.path.join(BaselineDirs[0], "_Timing"))
+    )
+
+    Initializer = getOption("Initializer", "")
+    Finalizer = getOption("Finalizer", "")
+    Teardown = getOption("Teardown", "")
+
+    PartInitializer = getOption("PartInitializer", "")
+    PartFinalizer = getOption("PartFinalizer", "")
+    PartTeardown = getOption("PartTeardown", "")
+
+    Config.configured_tests = []
+
+    testdirs = getOption("TestDirs", "").split()
+    if testdirs:
+        Config.configured_tests = findTests(testdirs, True)
+
+    if args:
+        if Options.tests_file:
+            error("cannot specify tests both on command line and with --tests-file")
+
+        tests = findTests(args)
+
+    else:
+        if Options.rerun:
+            if Options.tests_file:
+                error("cannot specify both --rerun and --tests-file")
+
+            (success, tests) = readTestsFile(StateFile)
+
+            if success:
+                if not tests:
+                    output("no tests failed last time")
+                    sys.exit(0)
+
+            else:
+                warning("cannot read state file, executing all tests")
+                tests = Config.configured_tests
+
+        elif Options.tests_file:
+            (success, tests) = readTestsFile(Options.tests_file)
+
+            if not success:
+                warning(f"cannot read file with tests: {Options.tests_file}")
+
+        else:
+            tests = Config.configured_tests
+
+    if Options.groups:
+        groups = Options.groups.split(",")
+        Options.groups = {g for g in groups if not g.startswith("-")}
+        Options.no_groups = {g[1:] for g in groups if g.startswith("-")}
+
+        def rightGroup(t):
+            if not t:
+                return True
+
+            if t.groups & Options.groups:
+                return True
+
+            if "" in Options.no_groups:
+                if not t.groups:
+                    return True
+
+            elif Options.no_groups:
+                if t.groups & Options.no_groups:
+                    return False
+
+                return True
+
+            return False
+
+        tests = [t for t in tests if rightGroup(t)]
+
+    if not tests:
+        output("no tests to execute")
+        sys.exit(0)
+
+    tests = mergeTestParts(tests)
+
+    if Options.doc:
+        outputDocumentation(tests, Options.doc)
+        sys.exit(0)
+
+    for d in BaselineDirs:
+        mkdir(d)
+
+    mkdir(TmpDir)
+
+    if sys.platform == "win32":
+        # On win32 we have to use a named pipe so that python's multiprocessing
+        # chooses AF_PIPE as the family type.
+        addr = f"\\\\.\\pipe\\btest-pipe-{os.getpid()}"
+    else:
+        # Building our own path to avoid "error: AF_UNIX path too long" on
+        # some platforms. See BIT-862.
+        sname = f"btest-socket-{os.getpid()}"
+        addr = os.path.join(tempfile.gettempdir(), sname)
+
+        # Check if the pathname is too long to fit in struct sockaddr_un (the
+        # maximum length is system-dependent, so here we just use 100, which seems
+        # a safe default choice).
+        if len(addr) > 100:
+            # Try relative path to TmpDir (which would usually be ".tmp").
+            addr = os.path.join(os.path.relpath(TmpDir), sname)
+
+            # If the path is still too long, then use the global tmp directory.
+            if len(addr) > 100:
+                addr = os.path.join("/tmp", sname)
+
+    mgr = TestManager(address=addr)
+
+    try:
+        if Options.list:
+            for test in sorted(tests):
+                if test.name:
+                    print(test.name)
+            sys.exit(0)
+        else:
+            (succeeded, failed, skipped, unstable, failed_expected) = mgr.run(
+                copy.deepcopy(tests), output_handler
+            )
+            total = succeeded + failed + skipped
+
+        output_handler.finished()
+
+    # Ctrl-C can lead to broken pipe (e.g. FreeBSD), so include IOError here:
+    except (Abort, KeyboardInterrupt, OSError) as exc:
+        output_handler.finished()
+        print(str(exc) or f"Aborted with {type(exc).__name__}.", file=sys.stderr)
+        sys.stderr.flush()
+        # Explicitly shut down sync manager to avoid leaking manager
+        # processes, particularly with --abort-on-failure:
+        mgr.shutdown()
+        sys.exit(1)
+
+    skip = f", {skipped} skipped" if skipped > 0 else ""
+    unstablestr = f", {unstable} unstable" if unstable > 0 else ""
+    failed_expectedstr = (
+        f" (with {failed_expected} expected to fail)" if failed_expected > 0 else ""
+    )
+
+    if failed > 0:
+        if not Options.quiet:
+            output(
+                "{} of {} test{} failed{}{}{}".format(
+                    failed,
+                    total,
+                    "s" if total > 1 else "",
+                    failed_expectedstr,
+                    skip,
+                    unstablestr,
+                )
+            )
+
+        if failed == failed_expected:
+            sys.exit(0)
+        else:
+            sys.exit(1)
+
+    elif skipped > 0 or unstable > 0:
+        if not Options.quiet:
+            output(
+                "{} test{} successful{}{}".format(
+                    succeeded, "s" if succeeded != 1 else "", skip, unstablestr
+                )
+            )
+
+        sys.exit(0)
+
+    else:
+        if not Options.quiet:
+            output(f"all {total} tests successful")
+
+        sys.exit(0)

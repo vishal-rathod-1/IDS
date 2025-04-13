@@ -1,0 +1,68 @@
+#! /usr/bin/env python3
+
+"""
+This is a prototypical implementation of a Zeek management client, as sketched
+in the following architecture design doc:
+
+https://docs.google.com/document/d/1r0wXnihx4yESOpLJ87Wh2g1V-aHOFUkbgiFe8RHJpZo/edit
+
+Work on this client is currently in progress and maturing over the course of
+the Zeek 5.x series. Feedback is welcome. This implementation adopts many of
+the idioms and primitives also used by the zkg package manager.
+"""
+# https://pypi.org/project/argcomplete/#global-completion
+# PYTHON_ARGCOMPLETE_OK
+
+import os.path
+import sys
+
+# For Zeek-bundled installation, prepend the Python path of the Zeek
+# installation to the search path. This ensures we find the matching module
+# first (or at all), avoiding potential conflicts with installations elsewhere
+# on the system.
+ZEEK_PYTHON_DIR = "/opt/zeek/lib/zeek/python"
+if os.path.isdir(ZEEK_PYTHON_DIR):
+    sys.path.insert(0, os.path.abspath(ZEEK_PYTHON_DIR))
+else:
+    ZEEK_PYTHON_DIR = None
+import zeekclient  # pylint: disable=wrong-import-position
+
+
+def main():
+    # Preliminary configuration update: environment variables can already take
+    # hold. This allows autocompleted settings to show values more accurately
+    # than our hardwired defaults.
+    zeekclient.CONFIG.update_from_env()
+
+    parser = zeekclient.cli.create_parser()
+
+    args = parser.parse_args()
+
+    # Finalize config settings in expected hierarchical order:
+    zeekclient.CONFIG.update_from_file(args.configfile)
+    zeekclient.CONFIG.update_from_env()
+    zeekclient.CONFIG.update_from_args(args)
+
+    if args.version:
+        print(zeekclient.__version__)
+        return 0
+
+    # Establish logging as per requested verbosity and formatting
+    if not args.quiet:
+        zeekclient.logs.configure(
+            zeekclient.CONFIG.getint("client", "verbosity"),
+            zeekclient.CONFIG.getboolean("client", "rich_logging_format"),
+        )
+
+    if not args.command:
+        zeekclient.LOG.error("please provide a command to execute.")
+        return 1
+
+    try:
+        return args.run_cmd(args)
+    except KeyboardInterrupt:
+        return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

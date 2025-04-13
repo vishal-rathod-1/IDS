@@ -1,0 +1,84 @@
+// Copyright (c) 2020-2023 by the Zeek Project. See LICENSE for details.
+
+#pragma once
+
+#include <string>
+#include <vector>
+
+#include <hilti/rt/filesystem.h>
+
+#include <hilti/base/util.h>
+
+namespace spicy {
+
+struct Configuration {
+    /**
+     * Default constructor that initializes all settings assuming we're
+     * running out of the installation directory (i.e., not the build
+     * directory)
+     */
+    Configuration();
+
+    bool uses_build_directory; /**< True if all information pertains to running outside of the build directory. */
+
+    hilti::rt::filesystem::path spicyc; /**< Full path to `spicyc` binary */
+    std::vector<hilti::rt::filesystem::path>
+        spicy_library_paths; /**< Default search path for Spicy modules, separated by `:` */
+
+    std::vector<hilti::rt::filesystem::path>
+        runtime_cxx_include_paths; /**< C++ include directories for runtime headers */
+    std::vector<hilti::rt::filesystem::path> runtime_cxx_library_paths; /**< C++ library directories for runtime */
+    std::vector<hilti::rt::filesystem::path>
+        toolchain_cxx_include_paths; /**< C++ include directories for toolchain headers */
+    std::vector<hilti::rt::filesystem::path> toolchain_cxx_library_paths; /**< C++ library directories for runtime */
+
+    std::vector<std::string> compiler_cxx_flags_debug; /**< C++ compiler flags when compiling custom code in debug mode
+                                                          that uses the HILTI compiler */
+    std::vector<std::string> compiler_ld_flags_debug;  /**< Linker flags when compiling custom code in debug mode that
+                                                          uses the Spicy compiler */
+    std::vector<std::string> runtime_cxx_flags_debug;  /**< C++ compiler flags when compiling custom code in debug mode
+                                                          that uses the Spicy runtime library */
+    std::vector<std::string> runtime_ld_flags_debug;   /**< Linker flags when compiling custom code in debug mode that
+                                                          uses the Spicy runtime library */
+    std::vector<std::string> compiler_cxx_flags_release; /**< C++ compiler flags when compiling custom code in release
+                                                            mode that uses the Spicy compiler */
+    std::vector<std::string> compiler_ld_flags_release;  /**< Linker flags when compiling custom code in release mode
+                                                            that uses the Spicy compiler */
+    std::vector<std::string> runtime_cxx_flags_release;  /**< C++ compiler flags when compiling custom code in release
+                                                            mode that uses the Spicy runtime library */
+    std::vector<std::string> runtime_ld_flags_release; /**< Linker flags when compiling custom code in release mode that
+                                                          uses the Spicy runtime library */
+
+    std::vector<std::string>
+        hlto_cxx_flags_debug; /**< C++ compiler flags when building a precompiled HLTO library in debug mode. */
+    std::vector<std::string>
+        hlto_ld_flags_debug; /**< Linker flags when when building a precompiled HLTO library in debug mode. */
+    std::vector<std::string> hlto_cxx_flags_release; /**< C++ compiler flags when when building a precompiled HLTO
+                                                        library in release mode. */
+    std::vector<std::string>
+        hlto_ld_flags_release; /**< Linker flags when when building a precompiled HLTO library in release mode. */
+
+    std::map<std::string, int> preprocessor_constants; /**< constants available for `@if` preprocessor tests. */
+
+    /**
+     * Augments the global HILTI configuration with Spicy's options. For
+     * configuration options that are offered separately by both HILTI and
+     * Spicy (e.g., the compiler flags), this modifies the global HILTI
+     * configuration by merging in the corresponding Spicy values. This all
+     * reconfigures this Spicy configuration's paths based on the HILTI
+     * configuration's setting on whether we're running out of the build
+     * directory.
+     */
+    static void extendHiltiConfiguration();
+
+private:
+    void init(bool use_build_directory);
+};
+
+/**
+ * Returns a reference to the global configuration information. This is the
+ * same information that `hilti-config` reports as well.
+ */
+extern Configuration& configuration();
+
+} // namespace spicy
