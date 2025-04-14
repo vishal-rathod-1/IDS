@@ -1,0 +1,141 @@
+Intrusion Detection System (IDS) Setup
+
+This project sets up a complete IDS stack using Suricata, Zeek, Filebeat, Elasticsearch, and Kibana on a Linux machine. It captures and analyzes network traffic to detect suspicious activity, then visualizes the data in Kibana.
+
+Components:
+
+- Suricata – Network-based IDS/IPS
+- Zeek – Network traffic analyzer
+- Filebeat – Forwards Zeek/Suricata logs to Elasticsearch
+- Elasticsearch – Stores and indexes logs
+- Kibana – Visualizes the data
+
+Prerequisites:
+
+- Ubuntu/Kali or similar Debian-based Linux
+- sudo access
+- Internet connection
+
+Installation Steps:
+
+1. System Preparation
+
+sudo apt update && sudo apt upgrade -y
+sudo apt install ifupdown net-tools -y
+
+Configure network interfaces:
+
+sudo nano /etc/network/interfaces
+
+Update to:
+
+# Loopback
+auto lo
+iface lo inet loopback
+
+# Management interface
+allow-hotplug enp0s17
+iface enp0s17 inet dhcp
+
+# Sniffing interface
+allow-hotplug eth0
+iface eth0 inet manual
+up ifconfig eth0 promisc up
+down ifconfig eth0 promisc down
+
+Then reboot:
+
+sudo reboot now
+
+2. Install Suricata
+
+sudo apt install suricata -y
+sudo suricata-update
+
+3. Install Zeek
+
+sudo apt install git cmake make gcc g++ flex bison libpcap-dev python3-dev swig zlib1g-dev -y
+
+echo 'deb http://download.opensuse.org/repositories/security:/zeek/xUbuntu_22.04/ /' | sudo tee /etc/apt/sources.list.d/security:zeek.list
+curl -fsSL https://download.opensuse.org/repositories/security:zeek/xUbuntu_22.04/Release.key | gpg --dearmor | sudo tee /etc/apt/trusted.gpg.d/security_zeek.gpg > /dev/null
+sudo apt update
+sudo apt install zeek-6.0 -y
+
+Add Zeek to system path (run which zeek to get the path):
+
+sudo visudo
+# Add zeek path to:
+# Defaults secure_path="...:/opt/zeek/bin"
+
+Enable cron job:
+
+crontab -e
+# Add:
+*/5 * * * * /opt/zeek/bin/zeekctl cron
+
+Enable JSON logs:
+
+sudo nano /opt/zeek/share/zeek/site/local.zeek
+# Add at the bottom:
+@load policy/tuning/json-logs.zeek
+
+4. Install Elasticsearch
+
+cd ~/Downloads
+wget https://artifacts.elastic.co/downloads/elasticsearch/elasticsearch-8.17.4-linux-x86_64.tar.gz
+wget https://artifacts.elastic.co/downloads/elasticsearch/elasticsearch-8.17.4-linux-x86_64.tar.gz.sha512
+shasum -a 512 -c elasticsearch-8.17.4-linux-x86_64.tar.gz.sha512
+tar -xzf elasticsearch-8.17.4-linux-x86_64.tar.gz
+
+5. Install Filebeat
+
+curl -L -O https://artifacts.elastic.co/downloads/beats/filebeat/filebeat-8.17.4-linux-x86_64.tar.gz
+tar xzvf filebeat-8.17.4-linux-x86_64.tar.gz
+
+Edit config:
+
+sudo nano filebeat-8.17.4-linux-x86_64/filebeat.yml
+
+- Enable Kibana output (localhost:5601)
+- Enable Elasticsearch output and add your credentials
+
+Then:
+
+sudo ./filebeat modules enable zeek suricata
+sudo ./filebeat keystore create
+sudo ./filebeat setup -e
+
+6. Install Kibana
+
+curl -O https://artifacts.elastic.co/downloads/kibana/kibana-8.17.4-linux-x86_64.tar.gz
+curl https://artifacts.elastic.co/downloads/kibana/kibana-8.17.4-linux-x86_64.tar.gz.sha512 | shasum -a 512 -c -
+tar -xzf kibana-8.17.4-linux-x86_64.tar.gz
+cd kibana-8.17.4/
+
+7. Start Services
+
+sudo service suricata start
+sudo zeekctl deploy
+sudo ./filebeat-8.17.4-linux-x86_64/filebeat -e &
+
+Check status:
+
+sudo zeekctl status
+
+8. Simulate Network Traffic (Optional)
+
+sudo apt install tcpreplay -y
+wget https://s3.amazonaws.com/tcpreplay-pcap-files/bigFlows.pcap
+sudo tcpreplay -t -v -i eth0 bigFlows.pcap
+
+9. View in Kibana
+
+- Open your browser
+- Go to: http://localhost:5601
+- Navigate to Discover tab
+
+Final Notes:
+
+- Make sure your interfaces are named correctly
+- Verify Zeek and Suricata are writing logs
+- Filebeat must be correctly configured to read and send logs to Elasticsearch
