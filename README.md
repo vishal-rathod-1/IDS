@@ -1,5 +1,5 @@
 Intrusion Detection System - Tool Descriptions
-<img src="screenshot.png" alt="Screenshot" width="400"/>
+<img src="ids.png" alt="Screenshot" width="400"/>
 
 This project integrates several powerful tools to build a functional IDS (Intrusion Detection System). Each component in the stack plays a unique role in monitoring, capturing, processing, and visualizing network data.
 
