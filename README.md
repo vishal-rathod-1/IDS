@@ -1,84 +1,56 @@
----
+Intrusion Detection System - Tool Descriptions
 
-Suricata + ELK Setup Guide
+This project integrates several powerful tools to build a functional IDS (Intrusion Detection System). Each component in the stack plays a unique role in monitoring, capturing, processing, and visualizing network data.
 
-This project contains basic instructions to download and set up Suricata, Elasticsearch, and Kibana for network monitoring and analysis.
+1. Suricata
 
----
+Suricata is an open-source network threat detection engine capable of real-time intrusion detection (IDS), intrusion prevention (IPS), and network security monitoring (NSM). It inspects traffic using rules and signatures and can log protocol information, alerts, and metadata.
 
-Downloads
+Use Case:
+- Detects known attack patterns
+- Generates alerts when suspicious packets are detected
+- Parses protocols like HTTP, DNS, TLS, etc.
 
-Suricata
+2. Zeek
 
-Download and install Suricata:
+Zeek (formerly known as Bro) is a powerful network analysis framework that focuses on application-level traffic analysis. It does not rely on signatures like Suricata but instead logs activity and can detect anomalies through policy scripts.
 
-sudo apt update  
-sudo apt install -y suricata
-sudo suricata-update
+Use Case:
+- Deep network traffic logging
+- Behavioral analysis
+- Creates readable logs in JSON or plain text format
 
-Elasticsearch
+3. Filebeat
 
-Download and install Elasticsearch:
+Filebeat is a lightweight shipper for forwarding and centralizing log data. It monitors log files and sends them to a destination like Elasticsearch. In this setup, it is used to ship Suricata and Zeek logs to Elasticsearch for indexing.
 
-wget https://artifacts.elastic.co/downloads/elasticsearch/elasticsearch-8.11.1-amd64.deb  
-sudo dpkg -i elasticsearch-8.11.1-amd64.deb
+Use Case:
+- Monitors Zeek and Suricata log directories
+- Ships logs to Elasticsearch securely and efficiently
 
-Start and enable the service:
+4. Elasticsearch
 
-sudo systemctl start elasticsearch  
-sudo systemctl enable elasticsearch
+Elasticsearch is a distributed search and analytics engine that stores and indexes data for fast search and retrieval. It receives structured logs from Filebeat and indexes them to make them searchable.
 
-Check if it’s running:
+Use Case:
+- Stores and indexes logs from Filebeat
+- Supports full-text search and data aggregation
 
-curl -X GET http://localhost:9200
+5. Kibana
 
----
+Kibana is a visualization tool for Elasticsearch data. It allows users to build dashboards, visualizations, and search logs interactively. It helps in understanding patterns, anomalies, and security incidents by visualizing the raw data.
 
-Kibana
+Use Case:
+- Visualizes IDS alerts and logs from Zeek and Suricata
+- Allows filtering, searching, and dashboard creation
+- Enables security analysts to gain insights quickly
 
-Download Kibana:
+Summary:
 
-wget https://artifacts.elastic.co/downloads/kibana/kibana-8.11.1-amd64.deb  
-sudo dpkg -i kibana-8.11.1-amd64.deb
+- Suricata: Signature-based IDS/IPS
+- Zeek: Behavior-based traffic analyzer
+- Filebeat: Log shipper
+- Elasticsearch: Storage and indexing engine
+- Kibana: Data visualization and exploration
 
-Start and enable Kibana:
-
-sudo systemctl start kibana  
-sudo systemctl enable kibana
-
-Once running, open http://localhost:5601 in your browser.
-
----
-
-Integration with Suricata
-
-To forward Suricata logs to Elasticsearch, enable EVE JSON logging in Suricata’s config:
-
-(outputs section in /etc/suricata/suricata.yaml)
-
-outputs:
-  - eve-log:
-      enabled: yes
-      filetype: regular
-      filename: /var/log/suricata/eve.json
-      types:
-        - alert
-        - dns
-        - http
-        - tls
-
-Use tools like Filebeat or Logstash to ship eve.json logs into Elasticsearch.
-
----
-
-Notes
-
-- Make sure all services (Suricata, Elasticsearch, Kibana) are compatible in terms of version.
-- You may need to adjust system settings for performance, depending on your deployment.
-
----
-
-Resources
-
-Suricata Documentation: https://docs.suricata.io/  
-Elastic Stack Docs: https://www.elastic.co/guide/index.html
+These tools, when integrated together, form a comprehensive network security monitoring system.
