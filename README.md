@@ -19,6 +19,15 @@ Use Case:
 - Generates alerts when suspicious packets are detected
 - Parses protocols like HTTP, DNS, TLS, etc.
 
+sudo apt install suricata
+sudo suricata-update
+cd /tmp/ && curl -LO https://rules.emergingthreats.net/open/suricata-6.0.8/emerging.rules.tar.gz
+sudo tar -xvzf emerging.rules.tar.gz
+sudo mv rules/* /etc/suricata/rules/
+sudo chmod 640 /etc/suricata/rules/*
+
+sudo systemctl restart suricata
+
 2. Zeek
 
 Zeek (formerly known as Bro) is a powerful network analysis framework that focuses on application-level traffic analysis. It does not rely on signatures like Suricata but instead logs activity and can detect anomalies through policy scripts.
@@ -28,6 +37,14 @@ Use Case:
 - Behavioral analysis
 - Creates readable logs in JSON or plain text format
 
+sudo apt-get update
+sudo apt-get install -y --no-install-recommends g++ cmake make libpcap-dev
+
+echo 'deb http://download.opensuse.org/repositories/security:/zeek/xUbuntu_22.04/ /' | sudo tee /etc/apt/sources.list.d/security:zeek.list
+curl -fsSL https://download.opensuse.org/repositories/security:zeek/xUbuntu_22.04/Release.key | gpg --dearmor | sudo tee /etc/apt/trusted.gpg.d/security_zeek.gpg > /dev/null
+sudo apt update
+sudo apt install zeek-6.0
+
 3. Filebeat
 
 Filebeat is a lightweight shipper for forwarding and centralizing log data. It monitors log files and sends them to a destination like Elasticsearch. In this setup, it is used to ship Suricata and Zeek logs to Elasticsearch for indexing.
@@ -35,6 +52,8 @@ Filebeat is a lightweight shipper for forwarding and centralizing log data. It m
 Use Case:
 - Monitors Zeek and Suricata log directories
 - Ships logs to Elasticsearch securely and efficiently
+
+sudo apt install filebeat
 
 4. Elasticsearch
 
@@ -44,6 +63,9 @@ Use Case:
 - Stores and indexes logs from Filebeat
 - Supports full-text search and data aggregation
 
+sudo apt install elasticsearch
+
+
 5. Kibana
 
 Kibana is a visualization tool for Elasticsearch data. It allows users to build dashboards, visualizations, and search logs interactively. It helps in understanding patterns, anomalies, and security incidents by visualizing the raw data.
@@ -52,6 +74,8 @@ Use Case:
 - Visualizes IDS alerts and logs from Zeek and Suricata
 - Allows filtering, searching, and dashboard creation
 - Enables security analysts to gain insights quickly
+
+sudo apt install kibana
 
 Summary:
 
