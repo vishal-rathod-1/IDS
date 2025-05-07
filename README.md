@@ -20,6 +20,7 @@ Use Case:
 - Parses protocols like HTTP, DNS, TLS, etc.
 
 sudo apt install suricata
+
 sudo suricata-update
 cd /tmp/ && curl -LO https://rules.emergingthreats.net/open/suricata-6.0.8/emerging.rules.tar.gz
 sudo tar -xvzf emerging.rules.tar.gz
