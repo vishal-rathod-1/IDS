@@ -43,6 +43,7 @@ Use Case:
 - Creates readable logs in JSON or plain text format
 
 sudo apt-get update
+
 sudo apt-get install -y --no-install-recommends g++ cmake make libpcap-dev
 
 echo 'deb http://download.opensuse.org/repositories/security:/zeek/xUbuntu_22.04/ /' | sudo tee /etc/apt/sources.list.d/security:zeek.list
@@ -87,10 +88,11 @@ sudo apt install kibana
 
 Summary:
 
-- Suricata: Signature-based IDS/IPS
+- Suricata: Signature-based IDS
 - Zeek: Behavior-based traffic analyzer
 - Filebeat: Log shipper
 - Elasticsearch: Storage and indexing engine
 - Kibana: Data visualization and exploration
+
 
 These tools, when integrated together, form a comprehensive network security monitoring system.
