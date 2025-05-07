@@ -1,1 +1,0 @@
--i eth0 -U .status -p zeekctl -p zeekctl-live -p standalone -p local -p zeek local.zeek zeekctl zeekctl/standalone zeekctl/auto

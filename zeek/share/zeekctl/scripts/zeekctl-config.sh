@@ -1,1 +1,0 @@
-../../../spool/zeekctl-config.sh
