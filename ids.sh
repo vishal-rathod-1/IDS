@@ -18,23 +18,23 @@ curl -fsSL https://download.opensuse.org/repositories/security:zeek/xUbuntu_22.0
 sudo apt update
 sudo apt install zeek-6.0 -y
 
+#Install suricata
+sudo apt install suricata -y
+
+#install kibana
+sudo apt install kibana -y
+
+#install filebeat
+sudo apt install filebeat -y
+
+#install elastic search
+
+sudo apt install elasticsearch -y
+
 # Install tcpreplay
 sudo apt install tcpreplay -y
 
-# Download Elasticsearch, Kibana, Filebeat
-cd ~/Downloads
-wget https://artifacts.elastic.co/downloads/elasticsearch/elasticsearch-8.17.4-linux-x86_64.tar.gz
-wget https://artifacts.elastic.co/downloads/elasticsearch/elasticsearch-8.17.4-linux-x86_64.tar.gz.sha512
-shasum -a 512 -c elasticsearch-8.17.4-linux-x86_64.tar.gz.sha512
-tar -xzf elasticsearch-8.17.4-linux-x86_64.tar.gz
-
-curl -L -O https://artifacts.elastic.co/downloads/beats/filebeat/filebeat-8.17.4-linux-x86_64.tar.gz
-tar xzvf filebeat-8.17.4-linux-x86_64.tar.gz
-
-curl -O https://artifacts.elastic.co/downloads/kibana/kibana-8.17.4-linux-x86_64.tar.gz
-curl https://artifacts.elastic.co/downloads/kibana/kibana-8.17.4-linux-x86_64.tar.gz.sha512 | shasum -a 512 -c -
-tar -xzf kibana-8.17.4-linux-x86_64.tar.gz
-
+#Update this 
 echo "Setup base complete. Please manually configure:"
 echo "- /etc/network/interfaces"
 echo "- filebeat.yml"
