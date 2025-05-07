@@ -22,9 +22,13 @@ Use Case:
 sudo apt install suricata
 
 sudo suricata-update
+
 cd /tmp/ && curl -LO https://rules.emergingthreats.net/open/suricata-6.0.8/emerging.rules.tar.gz
+
 sudo tar -xvzf emerging.rules.tar.gz
+
 sudo mv rules/* /etc/suricata/rules/
+
 sudo chmod 640 /etc/suricata/rules/*
 
 sudo systemctl restart suricata
