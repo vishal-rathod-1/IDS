@@ -53,6 +53,13 @@ curl -fsSL https://download.opensuse.org/repositories/security:zeek/xUbuntu_22.0
 sudo apt update
 
 sudo apt install zeek-6.0
+./configure --prefix=/opt/zeek
+make -j$(nproc)
+sudo make install
+
+echo 'export PATH=$PATH:/opt/zeek/bin' >> ~/.bashrc
+source ~/.bashr
+
 
 3. Filebeat
 
